@@ -61,7 +61,7 @@ function createHttpClient(proxyUrl, baseUrl) {
     const defaultHeaders = buildStealthHeaders({ baseUrl, userAgent });
 
     const request = async (options = {}) => {
-        const jitter = 200 + Math.random() * 400;
+        const jitter = 50 + Math.random() * 150;
         await sleep(jitter);
 
         const timeout =
@@ -220,8 +220,8 @@ function parseJobFromElement($, $el, baseUrl) {
             title,
             company,
             location,
-            salary,
-            jobType: 'Not specified',
+            salary: salary !== 'Not specified' ? salary : null,
+            jobType: null,
             postedDate,
             descriptionHtml: formatDescription(descriptionHtml, description),
             descriptionText: description,
@@ -233,6 +233,10 @@ function parseJobFromElement($, $el, baseUrl) {
         return null;
     }
 }
+
+/**
+ * Extract jobs from various API response structures
+ */
 
 /**
  * Extract jobs from various API response structures
@@ -271,8 +275,8 @@ function extractJobsFromAPIResponse(data) {
                 title: item.title || item.titulo || item.name || '',
                 company: item.company || item.empresa || item.nombreEmpresa || '',
                 location: item.location || item.ubicacion || item.city || item.ciudad || '',
-                salary: item.salary || item.salario || item.sueldo || 'Not specified',
-                jobType: item.type || item.tipo || item.employmentType || 'Not specified',
+                salary: item.salary || item.salario || item.sueldo || null,
+                jobType: item.type || item.tipo || item.employmentType || null,
                 postedDate: item.date || item.fecha || item.postedDate || item.fechaPublicacion || '',
                 descriptionHtml: item.descriptionHtml || item.description || item.descripcion || '',
                 descriptionText: item.description ? stripHtml(item.description) : '',
@@ -407,11 +411,11 @@ function parseJobPosting(jobData) {
 
     return {
         title: jobData.title || '',
-        company: hiringOrg.name || '',
-        location,
-        salary,
-        jobType: jobTypeRaw || 'Not specified',
-        postedDate: jobData.datePosted || '',
+        company: hiringOrg.name || null,
+        location: location || null,
+        salary: salary !== 'Not specified' ? salary : null,
+        jobType: jobTypeRaw || null,
+        postedDate: jobData.datePosted || null,
         descriptionHtml: jobData.description || '',
         descriptionText: stripHtml(jobData.description || ''),
         url: jobData.url || '',
@@ -485,7 +489,7 @@ function parseJobDetail(html, baseUrl) {
     const fromJson = jsonJob ? parseJobPosting(jsonJob) : {};
 
     const descEl = $(
-        '[itemprop="description"], .bVj, .box_detail, .description, .fs16.fc_base.mt20, #descripcion-oferta, .bWord, div.description_offer',
+        '[itemprop="description"], .bVj, .box_detail, .description, .fs16.fc_base.mt20, #descripcion-oferta, .bWord, div.description_offer, .job-description',
     ).first();
     const metaDesc = $('meta[name="description"]').attr('content') || '';
     const descriptionHtml = formatDescription(fromJson.descriptionHtml || descEl.html(), fromJson.descriptionText || descEl.text().trim() || metaDesc);
@@ -493,14 +497,14 @@ function parseJobDetail(html, baseUrl) {
 
     const company =
         fromJson.company ||
-        $('.fc_base.fs20, .fc_base.mt5.fs16, a[data-company], a[data-accion*="Company"], [itemprop="hiringOrganization"]')
+        $('.fc_base.fs20, .fc_base.mt5.fs16, a[data-company], a[data-accion*="Company"], [itemprop="hiringOrganization"], .job-company')
             .first()
             .text()
             .trim();
 
     const location =
         fromJson.location ||
-        $('.fc_base.fs13, .fs13.fc_aux:not(.t_date), .tag_base, [data-qa="location"], [itemprop="addressLocality"]')
+        $('.fc_base.fs13, .fs13.fc_aux:not(.t_date), .tag_base, [data-qa="location"], [itemprop="addressLocality"], .job-location')
             .first()
             .text()
             .trim();
@@ -509,35 +513,35 @@ function parseJobDetail(html, baseUrl) {
         fromJson.postedDate ||
         $('meta[itemprop="datePosted"]').attr('content') ||
         $('time[datetime]').attr('datetime') ||
-        $('.fs13.fc_aux.t_date, .t_date, time, [data-qa="postedDate"]').first().text().trim();
+        $('.fs13.fc_aux.t_date, .t_date, time, [data-qa="postedDate"], .job-date').first().text().trim();
 
     const salary =
         fromJson.salary ||
-        $('.bCS.b-salary, .fs16.fc_base:not(.mt5), [data-qa="salary"], .tag_base.salary, [itemprop="baseSalary"]')
+        $('.bCS.b-salary, .fs16.fc_base:not(.mt5), [data-qa="salary"], .tag_base.salary, [itemprop="baseSalary"], .job-salary')
             .first()
             .text()
             .trim();
 
     const jobType =
         fromJson.jobType ||
-        $('[data-qa="employmentType"], .tag_base:contains("Tiempo"), .tag_base:contains("Completo")')
+        $('[data-qa="employmentType"], .tag_base:contains("Tiempo"), .tag_base:contains("Completo"), .tag_base:contains("Contrato"), .job-type')
             .first()
             .text()
             .trim();
 
     return {
-        descriptionHtml,
-        descriptionText,
-        company: company || fromJson.company || '',
-        location: location || fromJson.location || '',
-        salary: salary || fromJson.salary || 'Not specified',
-        jobType: jobType || 'Not specified',
-        postedDate,
+        descriptionHtml: descriptionHtml || null,
+        descriptionText: descriptionText || null,
+        company: company || fromJson.company || null,
+        location: location || fromJson.location || null,
+        salary: (salary !== 'Not specified' ? salary : null) || (fromJson.salary !== 'Not specified' ? fromJson.salary : null),
+        jobType: (jobType !== 'Not specified' ? jobType : null) || (fromJson.jobType !== 'Not specified' ? fromJson.jobType : null),
+        postedDate: postedDate || null,
         url: normalizeUrl(fromJson.url || '', baseUrl),
     };
 }
 
-async function enrichJobWithDetail(job, httpClient, baseUrl, getBrowserPage) {
+async function enrichJobWithDetailHttp(job, httpClient, baseUrl) {
     const detailUrl = normalizeUrl(job.url, baseUrl);
     if (!detailUrl) return job;
     const cleanUrl = detailUrl.split('#')[0];
@@ -552,48 +556,18 @@ async function enrichJobWithDetail(job, httpClient, baseUrl, getBrowserPage) {
             },
         });
 
-        if (response.statusCode >= 400 || !response.body) return job;
-
-        let detail = parseJobDetail(response.body, baseUrl);
-        const blocked = isBlockedHtml(response.body);
-
-        // Browser fallback for missing description/company
-        if (
-            getBrowserPage &&
-            (blocked || !detail.descriptionText || detail.descriptionText.length < 20 || detail.salary === 'Not specified')
-        ) {
-            try {
-                const page = await getBrowserPage();
-                if (page) {
-                    await page.goto(cleanUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
-                    await page.waitForSelector('div.description_offer, [itemprop="description"], .bVj, .box_detail', {
-                        timeout: 12000,
-                    }).catch(() => {});
-                    await page.waitForFunction(() => {
-                        const el = document.querySelector('div.description_offer, [itemprop="description"], .bVj, .box_detail');
-                        return el && el.textContent && el.textContent.trim().length > 20;
-                    }, { timeout: 12000 }).catch(() => {});
-                    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-                    const html = await page.content();
-                    const enriched = parseJobDetail(html, baseUrl);
-                    if (enriched.descriptionText && enriched.descriptionText.length > detail.descriptionText?.length) {
-                        detail = enriched;
-                    }
-                    if (detail.salary === 'Not specified' && enriched.salary && enriched.salary !== 'Not specified') {
-                        detail.salary = enriched.salary;
-                    }
-                    if (detail.postedDate === 'Not specified' && enriched.postedDate) {
-                        detail.postedDate = enriched.postedDate;
-                    }
-                    if (detail.jobType === 'Not specified' && enriched.jobType) {
-                        detail.jobType = enriched.jobType;
-                    }
-                    await page.close().catch(() => {});
-                }
-            } catch (err) {
-                log.debug(`Browser detail fetch failed for ${cleanUrl}: ${err.message}`);
-            }
+        if (response.statusCode >= 400 || !response.body) {
+            return { ...job, url: cleanUrl, _needsBrowser: true };
         }
+
+        const blocked = isBlockedHtml(response.body);
+        const detail = parseJobDetail(response.body, baseUrl);
+        const weak =
+            blocked ||
+            !detail.descriptionText ||
+            detail.descriptionText.length < 20 ||
+            detail.salary === 'Not specified' ||
+            detail.location === 'Not specified';
 
         return {
             ...job,
@@ -605,74 +579,105 @@ async function enrichJobWithDetail(job, httpClient, baseUrl, getBrowserPage) {
             salary: detail.salary || job.salary,
             jobType: detail.jobType || job.jobType,
             postedDate: detail.postedDate || job.postedDate,
+            _needsBrowser: weak,
+            _blockedHttp: blocked,
         };
     } catch (err) {
         log.debug(`Failed to enrich job ${detailUrl}: ${err.message}`);
-        return job;
+        return { ...job, url: cleanUrl, _needsBrowser: true };
     }
+}
+
+async function enrichJobWithDetailBrowser(job, page, baseUrl) {
+    const cleanUrl = job.url.split('#')[0];
+    await page.goto(cleanUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
+    await page.waitForSelector('div.description_offer, [itemprop="description"], .bVj, .box_detail', { timeout: 12000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+    const html = await page.content();
+    const detail = parseJobDetail(html, baseUrl);
+    const weak =
+        !detail.descriptionText ||
+        detail.descriptionText.length < 20 ||
+        detail.salary === 'Not specified' ||
+        detail.location === 'Not specified';
+    return {
+        ...job,
+        url: cleanUrl,
+        descriptionHtml: formatDescription(detail.descriptionHtml, detail.descriptionText || job.descriptionText),
+        descriptionText: detail.descriptionText || job.descriptionText || stripHtml(detail.descriptionHtml),
+        company: detail.company || job.company,
+        location: detail.location || job.location,
+        salary: detail.salary || job.salary,
+        jobType: detail.jobType || job.jobType,
+        postedDate: detail.postedDate || job.postedDate,
+        _needsBrowser: weak,
+    };
 }
 
 async function enrichJobsWithDetails(jobs, httpClient, baseUrl, maxConcurrency = 8, proxyConfiguration, listingCookies) {
     const enriched = [];
     let index = 0;
-    let browser = null;
-    let context = null;
-    let cookiesApplied = false;
-
-    const getBrowserPage = proxyConfiguration
-        ? async () => {
-              if (!browser) {
-                  const proxyUrl = await proxyConfiguration.newUrl();
-                  browser = await firefox.launch(
-                      await camoufoxLaunchOptions({
-                          headless: true,
-                          proxy: proxyUrl,
-                          geoip: true,
-                          os: 'windows',
-                          locale: 'es-ES',
-                      }),
-                  );
-                  context = await browser.newContext({
-                      locale: 'es-ES',
-                      userAgent: USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
-                      viewport: { width: 1280, height: 900 },
-                  });
-                  if (listingCookies?.length && !cookiesApplied) {
-                      try {
-                          await context.addCookies(
-                              listingCookies.map(c => ({
-                                  name: c.name,
-                                  value: c.value,
-                                  domain: c.domain || new URL(baseUrl).hostname,
-                                  path: c.path || '/',
-                                  expires: c.expires,
-                                  httpOnly: c.httpOnly,
-                                  secure: c.secure,
-                                  sameSite: c.sameSite,
-                              })),
-                          );
-                          cookiesApplied = true;
-                      } catch {
-                          // ignore cookie sync issues
-                      }
-                  }
-              }
-              return await context.newPage();
-          }
-        : null;
 
     const worker = async () => {
         while (index < jobs.length) {
             const current = jobs[index];
             index += 1;
-            const result = await enrichJobWithDetail(current, httpClient, baseUrl, getBrowserPage);
+            const result = await enrichJobWithDetailHttp(current, httpClient, baseUrl);
             enriched.push(result);
         }
     };
 
     const workers = Array.from({ length: Math.min(maxConcurrency, jobs.length) }, () => worker());
     await Promise.all(workers);
-    if (browser) await browser.close().catch(() => {});
+
+    const needsBrowser = enriched.filter(j => j._needsBrowser);
+    if (proxyConfiguration && needsBrowser.length) {
+        const proxyUrl = await proxyConfiguration.newUrl();
+        const browser = await firefox.launch(
+            await camoufoxLaunchOptions({
+                headless: true,
+                proxy: proxyUrl,
+                geoip: true,
+                os: 'windows',
+                locale: 'es-ES',
+            }),
+        );
+        const context = await browser.newContext({
+            locale: 'es-ES',
+            userAgent: USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
+            viewport: { width: 1280, height: 900 },
+        });
+        if (listingCookies?.length) {
+            try {
+                await context.addCookies(
+                    listingCookies.map(c => ({
+                        name: c.name,
+                        value: c.value,
+                        domain: c.domain || new URL(baseUrl).hostname,
+                        path: c.path || '/',
+                        expires: c.expires,
+                        httpOnly: c.httpOnly,
+                        secure: c.secure,
+                        sameSite: c.sameSite,
+                    })),
+                );
+            } catch {
+                // ignore cookie sync issues
+            }
+        }
+        const page = await context.newPage();
+        for (const job of needsBrowser) {
+            try {
+                const fixed = await enrichJobWithDetailBrowser(job, page, baseUrl);
+                Object.assign(job, fixed);
+            } catch (err) {
+                log.debug(`Browser detail fetch failed for ${job.url}: ${err.message}`);
+            }
+        }
+        await page.close().catch(() => {});
+        await context.close().catch(() => {});
+        await browser.close().catch(() => {});
+    }
 
     return enriched;
 }
@@ -993,7 +998,7 @@ try {
         if (uniqueJobs.length >= maxJobs) break;
     }
 
-    const chunkSize = 20;
+    const chunkSize = 10;
     let totalPushed = 0;
     for (let i = 0; i < uniqueJobs.length; i += chunkSize) {
         let chunk = uniqueJobs.slice(i, i + chunkSize);
@@ -1007,6 +1012,10 @@ try {
                 proxyConfiguration,
                 listingResult.cookies,
             );
+            const blockedCount = chunk.filter(j => j._blockedHttp).length;
+            const stillMissing = chunk.filter(j => j._needsBrowser).length;
+            stats.httpBlocked = (stats.httpBlocked || 0) + blockedCount;
+            stats.detailStillMissing = (stats.detailStillMissing || 0) + stillMissing;
         }
 
         const normalizedChunk = chunk.map(job => {
@@ -1057,5 +1066,3 @@ try {
 }
 
 await Actor.exit();
-
-
