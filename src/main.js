@@ -31,6 +31,11 @@ function formatDescription(descHtml, descText) {
     return `<p>${text.replace(/\n+/g, '<br>')}</p>`;
 }
 
+function truncateHtml(html, maxLen = 2000) {
+    if (!html) return html;
+    return html.length > maxLen ? `${html.slice(0, maxLen)}...` : html;
+}
+
 function buildStealthHeaders({ baseUrl, referer, userAgent }) {
     return {
         'User-Agent': userAgent,
@@ -931,7 +936,8 @@ try {
         }
 
         const normalizedChunk = chunk.map(job => {
-            const descriptionHtml = formatDescription(job.descriptionHtml, job.descriptionText);
+            const formattedHtml = formatDescription(job.descriptionHtml, job.descriptionText);
+            const descriptionHtml = truncateHtml(formattedHtml, 2000);
             const descriptionText = job.descriptionText || stripHtml(descriptionHtml);
             const missingFields = [];
             if (!descriptionText || descriptionText === 'Not specified') missingFields.push('descriptionText');
@@ -960,8 +966,14 @@ try {
             };
         });
 
-        await pushJobsInBatches(normalizedChunk, 10);
-        totalPushed += normalizedChunk.length;
+        const filteredChunk = normalizedChunk.filter(j => j.descriptionText && j.descriptionText !== 'Not specified');
+        const dropped = normalizedChunk.length - filteredChunk.length;
+        if (dropped > 0) {
+            stats.droppedNoDescription = (stats.droppedNoDescription || 0) + dropped;
+        }
+
+        await pushJobsInBatches(filteredChunk, 10);
+        totalPushed += filteredChunk.length;
         stats.totalJobs = totalPushed;
         log.info(`Pushed ${totalPushed}/${uniqueJobs.length} jobs so far`);
     }
