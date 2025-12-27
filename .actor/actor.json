@@ -2,6 +2,7 @@
     "actorSpecification": 1,
     "name": "computrabajo-jobs-scraper",
     "title": "Computrabajo Jobs Scraper",
+    "description": "Extract job listings from Computrabajo across Latin America (Argentina, Mexico, Chile, Peru, Colombia). Get comprehensive job data including titles, companies, locations, salaries, and full descriptions. Perfect for recruitment automation and employment market analysis.",
     "version": "1.0",
     "categories": [
         "BUSINESS",
