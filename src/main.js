@@ -16,6 +16,13 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+async function pushJobsInBatches(jobs, batchSize = 10) {
+    for (let i = 0; i < jobs.length; i += batchSize) {
+        const slice = jobs.slice(i, i + batchSize);
+        if (slice.length) await Actor.pushData(slice);
+    }
+}
+
 function formatDescription(descHtml, descText) {
     const html = (descHtml || '').trim();
     if (html) return html;
@@ -283,7 +290,7 @@ function extractJobsFromAPIResponse(data) {
  * Fast and reliable - uses Cheerio, no browser needed
  */
 async function extractJobsViaHTML(html, baseUrl) {
-    log.info('Parsing listing HTML with Cheerio');
+    log.debug('Parsing listing HTML with Cheerio');
 
     try {
         const $ = cheerio.load(html);
@@ -296,7 +303,7 @@ async function extractJobsViaHTML(html, baseUrl) {
         for (const selector of selectors) {
             jobElements = $(selector);
             if (jobElements.length > 0) {
-                log.info(`Found ${jobElements.length} job cards using selector: ${selector}`);
+                log.debug(`Found ${jobElements.length} job cards using selector: ${selector}`);
                 break;
             }
         }
@@ -307,7 +314,7 @@ async function extractJobsViaHTML(html, baseUrl) {
         });
 
         if (jobs.length > 0) {
-            log.info(`HTML extraction successful: ${jobs.length} jobs`);
+            log.debug(`HTML extraction successful: ${jobs.length} jobs`);
         }
 
         return { jobs, method: 'HTML' };
@@ -322,7 +329,7 @@ async function extractJobsViaHTML(html, baseUrl) {
  * Fallback - structured data from HTML
  */
 function extractJobsViaJsonLD(html) {
-    log.info('Parsing JSON-LD structured data');
+    log.debug('Parsing JSON-LD structured data');
 
     try {
         const $ = cheerio.load(html);
@@ -360,7 +367,7 @@ function extractJobsViaJsonLD(html) {
         });
 
         if (jobs.length > 0) {
-            log.info(`OK JSON-LD extraction successful: ${jobs.length} jobs`);
+            log.debug(`OK JSON-LD extraction successful: ${jobs.length} jobs`);
         }
 
         return { jobs, method: 'JSON-LD' };
@@ -603,6 +610,7 @@ async function fetchListingWithBrowser(searchUrl, proxyConfiguration, maxJobs, m
         async requestHandler({ page, request }) {
             log.info(`Browser: Processing ${request.url}`);
 
+            await page.addStyleTag({ content: '#pop-up-webpush-background, #pop-up-webpush { display: none !important; pointer-events: none !important; }' }).catch(() => {});
             page.on('response', async (response) => {
                 try {
                     const ct = response.headers()['content-type'] || '';
@@ -659,6 +667,11 @@ async function fetchListingWithBrowser(searchUrl, proxyConfiguration, maxJobs, m
 
             // Paginate via "Next" button (ajax/LinkedIn style)
             while (collected.length < maxJobs && pageCount < maxPages) {
+                await page.evaluate(() => {
+                    const blocker = document.getElementById('pop-up-webpush-background');
+                    if (blocker) blocker.remove();
+                }).catch(() => {});
+
                 const nextButton =
                     (await page.$('span.b_primary.w48.buildLink.cp')) ||
                     (await page.$('span.b_primary.w48.buildLink.cp:not([disabled])'));
@@ -857,40 +870,43 @@ try {
         if (uniqueJobs.length >= maxJobs) break;
     }
 
-    let finalJobs = uniqueJobs;
-    if (includeFullDescription && finalJobs.length > 0) {
-        log.info(`Fetching detail pages for descriptions (${finalJobs.length} jobs)...`);
-        finalJobs = await enrichJobsWithDetails(finalJobs, httpClient, baseUrl, Math.min(10, finalJobs.length));
-    }
+    const chunkSize = 20;
+    let totalPushed = 0;
+    for (let i = 0; i < uniqueJobs.length; i += chunkSize) {
+        let chunk = uniqueJobs.slice(i, i + chunkSize);
+        if (includeFullDescription) {
+            log.info(`Fetching detail pages for chunk ${i / chunkSize + 1} (${chunk.length} jobs)...`);
+            chunk = await enrichJobsWithDetails(chunk, httpClient, baseUrl, Math.min(10, chunk.length));
+        }
 
-    finalJobs = finalJobs.map(job => {
-        const descriptionHtml = formatDescription(job.descriptionHtml, job.descriptionText);
-        const descriptionText = job.descriptionText || stripHtml(descriptionHtml);
-        return {
-            title: job.title || 'Not specified',
-            company: job.company || 'Not specified',
-            location: job.location || 'Not specified',
-            salary: job.salary || 'Not specified',
-            jobType: job.jobType || 'Not specified',
-            postedDate: job.postedDate || '',
-            descriptionHtml,
-            descriptionText,
-            url: job.url,
-            scrapedAt: job.scrapedAt || new Date().toISOString(),
-        };
-    });
+        const normalizedChunk = chunk.map(job => {
+            const descriptionHtml = formatDescription(job.descriptionHtml, job.descriptionText);
+            const descriptionText = job.descriptionText || stripHtml(descriptionHtml);
+            return {
+                title: job.title || 'Not specified',
+                company: job.company || 'Not specified',
+                location: job.location || 'Not specified',
+                salary: job.salary || 'Not specified',
+                jobType: job.jobType || 'Not specified',
+                postedDate: job.postedDate || '',
+                descriptionHtml,
+                descriptionText,
+                url: job.url,
+                scrapedAt: job.scrapedAt || new Date().toISOString(),
+            };
+        });
 
-    if (finalJobs.length > 0) {
-        await Actor.pushData(finalJobs);
-        stats.totalJobs = finalJobs.length;
-        log.info(`OK Saved ${finalJobs.length} jobs to dataset`);
+        await pushJobsInBatches(normalizedChunk, 10);
+        totalPushed += normalizedChunk.length;
+        stats.totalJobs = totalPushed;
+        log.info(`Pushed ${totalPushed}/${uniqueJobs.length} jobs so far`);
     }
 
     stats.duration = `${Math.round((Date.now() - stats.startTime) / 1000)}s`;
-    stats.detailPagesFetched = includeFullDescription && stats.extractionMethod !== 'Browser' && finalJobs.length > 0;
+    stats.detailPagesFetched = includeFullDescription && stats.totalJobs > 0;
     await Actor.setValue('statistics', stats);
 
-    log.info('OK Scraping completed successfully!', stats);
+    log.info('Scraping completed', stats);
 
 } catch (error) {
     log.exception(error, 'Fatal error');
