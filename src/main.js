@@ -16,6 +16,14 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function formatDescription(descHtml, descText) {
+    const html = (descHtml || '').trim();
+    if (html) return html;
+    const text = (descText || '').trim();
+    if (!text) return '<p>Not specified</p>';
+    return `<p>${text.replace(/\n+/g, '<br>')}</p>`;
+}
+
 function buildStealthHeaders({ baseUrl, referer, userAgent }) {
     return {
         'User-Agent': userAgent,
@@ -103,7 +111,16 @@ function parseJobFromElement($, $el, baseUrl) {
 
         // Company
         let company = '';
-        const companySelectors = ['.fs16.fc_base.mt5', '.company', 'p.fs16.fc_base', '.fs16.fc_base a', '.js-o-link[data-company]'];
+        const companySelectors = [
+            '.fs16.fc_base.mt5',
+            '.company',
+            'p.fs16.fc_base',
+            '.fs16.fc_base a',
+            '.js-o-link[data-company]',
+            '[data-company]',
+            '[itemprop="hiringOrganization"]',
+            '[data-cy="company"]',
+        ];
         for (const selector of companySelectors) {
             const el = $el.find(selector).first();
             if (el.length && el.text().trim()) {
@@ -111,10 +128,21 @@ function parseJobFromElement($, $el, baseUrl) {
                 break;
             }
         }
+        if (!company) {
+            company = $el.attr('data-company') || '';
+        }
 
         // Location
         let location = '';
-        const locationSelectors = ['.fs13.fc_base', '.location', 'p.fs13', '.tag_base', '.fs13.fc_aux:not(.t_date)'];
+        const locationSelectors = [
+            '.fs13.fc_base',
+            '.location',
+            'p.fs13',
+            '.tag_base',
+            '.fs13.fc_aux:not(.t_date)',
+            '[data-cy="location"]',
+            '[itemprop="addressLocality"]',
+        ];
         for (const selector of locationSelectors) {
             const el = $el.find(selector).first();
             if (el.length && el.text().trim()) {
@@ -125,7 +153,15 @@ function parseJobFromElement($, $el, baseUrl) {
 
         // Salary
         let salary = 'Not specified';
-        const salarySelectors = ['.fs16.fc_base', '.salary', 'p.fs16:not(.mt5)', '.bCS.b-salary'];
+        const salarySelectors = [
+            '.fs16.fc_base',
+            '.salary',
+            'p.fs16:not(.mt5)',
+            '.bCS.b-salary',
+            '[data-salary]',
+            '[data-cy="salary"]',
+            '.fs13.fc_aux.salary',
+        ];
         for (const selector of salarySelectors) {
             const el = $el.find(selector).first();
             const text = el.text().trim();
@@ -134,27 +170,43 @@ function parseJobFromElement($, $el, baseUrl) {
                 break;
             }
         }
+        if (salary === 'Not specified') {
+            const attrSalary = $el.attr('data-salary');
+            if (attrSalary && attrSalary.trim()) salary = attrSalary.trim();
+        }
 
         // Description
         let description = '';
+        let descriptionHtml = '';
         const descSelectors = ['.fs13.fc_base.mt10', '.description', 'p.fs13.fc_base', 'p.fs13.fc_base.mt5'];
         for (const selector of descSelectors) {
             const el = $el.find(selector).first();
             if (el.length && el.text().trim()) {
                 description = el.text().trim();
+                descriptionHtml = el.html() || '';
                 break;
             }
         }
 
         // Posted date
         let postedDate = '';
-        const dateSelectors = ['.fs13.fc_aux', '.date', 'p.fs13.fc_aux', '.fs13.fc_aux.t_date'];
+        const dateSelectors = [
+            '.fs13.fc_aux',
+            '.date',
+            'p.fs13.fc_aux',
+            '.fs13.fc_aux.t_date',
+            'time[datetime]',
+            '[data-cy="postedDate"]',
+        ];
         for (const selector of dateSelectors) {
             const el = $el.find(selector).first();
             if (el.length && el.text().trim()) {
-                postedDate = el.text().trim();
+                postedDate = el.attr('datetime')?.trim() || el.text().trim();
                 break;
             }
+        }
+        if (!postedDate) {
+            postedDate = $el.attr('data-date') || '';
         }
 
         return {
@@ -164,7 +216,7 @@ function parseJobFromElement($, $el, baseUrl) {
             salary,
             jobType: 'Not specified',
             postedDate,
-            descriptionHtml: description,
+            descriptionHtml: formatDescription(descriptionHtml, description),
             descriptionText: description,
             url,
             scrapedAt: new Date().toISOString()
@@ -409,11 +461,11 @@ function parseJobDetail(html, baseUrl) {
     const fromJson = jsonJob ? parseJobPosting(jsonJob) : {};
 
     const descEl = $(
-        '[itemprop="description"], .bVj, .box_detail, .description, .fs16.fc_base.mt20, #descripcion-oferta, .bWord',
+        '[itemprop="description"], .bVj, .box_detail, .description, .fs16.fc_base.mt20, #descripcion-oferta, .bWord, div.description_offer',
     ).first();
     const metaDesc = $('meta[name="description"]').attr('content') || '';
-    const descriptionHtml = fromJson.descriptionHtml || descEl.html() || metaDesc;
-    const descriptionText = fromJson.descriptionText || descEl.text().trim() || metaDesc;
+    const descriptionHtml = formatDescription(fromJson.descriptionHtml || descEl.html(), fromJson.descriptionText || descEl.text().trim() || metaDesc);
+    const descriptionText = fromJson.descriptionText || stripHtml(descriptionHtml) || metaDesc;
 
     const company =
         fromJson.company ||
@@ -462,8 +514,8 @@ async function enrichJobWithDetail(job, httpClient, baseUrl) {
         return {
             ...job,
             url: detailUrl,
-            descriptionHtml: detail.descriptionHtml || job.descriptionHtml,
-            descriptionText: detail.descriptionText || job.descriptionText,
+            descriptionHtml: formatDescription(detail.descriptionHtml, detail.descriptionText || job.descriptionText),
+            descriptionText: detail.descriptionText || job.descriptionText || stripHtml(detail.descriptionHtml),
             company: detail.company || job.company,
             location: detail.location || job.location,
             salary: detail.salary || job.salary,
@@ -810,6 +862,23 @@ try {
         log.info(`Fetching detail pages for descriptions (${finalJobs.length} jobs)...`);
         finalJobs = await enrichJobsWithDetails(finalJobs, httpClient, baseUrl, Math.min(10, finalJobs.length));
     }
+
+    finalJobs = finalJobs.map(job => {
+        const descriptionHtml = formatDescription(job.descriptionHtml, job.descriptionText);
+        const descriptionText = job.descriptionText || stripHtml(descriptionHtml);
+        return {
+            title: job.title || 'Not specified',
+            company: job.company || 'Not specified',
+            location: job.location || 'Not specified',
+            salary: job.salary || 'Not specified',
+            jobType: job.jobType || 'Not specified',
+            postedDate: job.postedDate || '',
+            descriptionHtml,
+            descriptionText,
+            url: job.url,
+            scrapedAt: job.scrapedAt || new Date().toISOString(),
+        };
+    });
 
     if (finalJobs.length > 0) {
         await Actor.pushData(finalJobs);
