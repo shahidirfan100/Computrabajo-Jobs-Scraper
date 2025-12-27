@@ -60,7 +60,7 @@ function createHttpClient(proxyUrl, baseUrl) {
             cookieJar,
             throwHttpErrors: false,
             timeout,
-            retry: { limit: 2, backoff: 500 },
+            retry: { limit: 2 },
             headers: { ...defaultHeaders, ...(options.headers || {}) },
             ...options,
         });
@@ -71,7 +71,7 @@ function createHttpClient(proxyUrl, baseUrl) {
 
 // ============================================================================
 // COMPUTRABAJO JOBS SCRAPER - PRODUCTION READY
-// Strategy: HTTP First -> HTML Parsing -> JSON-LD -> Browser Fallback
+// Hybrid: Playwright for listing (bypass) + Cheerio/got for fast detail pages
 // ============================================================================
 
 await Actor.init();
@@ -176,58 +176,6 @@ function parseJobFromElement($, $el, baseUrl) {
 }
 
 /**
- * STRATEGY 1: Extract jobs via internal API (HTTP + JSON)
- * Most efficient - no browser needed, pure JSON parsing
- */
-async function extractJobsViaAPI(url, httpClient, baseUrl) {
-    log.info('Strategy 1: Attempting to extract jobs via internal API (HTTP + JSON)');
-
-    try {
-        const apiEndpoints = [
-            `${url.replace('/empleos-de-', '/api/search?q=')}&limit=100`,
-            `${url}?format=json`,
-            `${new URL(url).origin}/api/jobs`,
-        ];
-
-        for (const endpoint of apiEndpoints) {
-            try {
-                const response = await httpClient.request({
-                    url: endpoint,
-                    headers: {
-                        Accept: 'application/json',
-                        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-                        Referer: baseUrl,
-                    },
-                });
-
-                if (response.statusCode === 200 && response.body) {
-                    try {
-                        const data = typeof response.body === 'string' ? JSON.parse(response.body) : response.body;
-                        const jobs = extractJobsFromAPIResponse(data);
-
-                        if (jobs.length > 0) {
-                            log.info(`OK API extraction successful: ${jobs.length} jobs from ${endpoint}`);
-                            return { jobs, method: 'API' };
-                        }
-                    } catch (parseErr) {
-                        log.debug(`Failed to parse JSON from ${endpoint}: ${parseErr.message}`);
-                    }
-                } else if (response.statusCode === 403) {
-                    log.warningOnce(`API endpoint blocked with 403: ${endpoint}`);
-                }
-            } catch (err) {
-                log.debug(`API endpoint failed: ${endpoint} - ${err.message}`);
-            }
-        }
-
-        return { jobs: [], method: 'API' };
-    } catch (error) {
-        log.warning(`API extraction failed: ${error.message}`);
-        return { jobs: [], method: 'API' };
-    }
-}
-
-/**
  * Extract jobs from various API response structures
  */
 function extractJobsFromAPIResponse(data) {
@@ -283,7 +231,7 @@ function extractJobsFromAPIResponse(data) {
  * Fast and reliable - uses Cheerio, no browser needed
  */
 async function extractJobsViaHTML(html, baseUrl) {
-    log.info('Strategy 2: Extracting jobs via pure HTML parsing (HTTP + Cheerio)');
+    log.info('Parsing listing HTML with Cheerio');
 
     try {
         const $ = cheerio.load(html);
@@ -322,7 +270,7 @@ async function extractJobsViaHTML(html, baseUrl) {
  * Fallback - structured data from HTML
  */
 function extractJobsViaJsonLD(html) {
-    log.info('Strategy 3: Attempting to extract jobs from JSON-LD structured data');
+    log.info('Parsing JSON-LD structured data');
 
     try {
         const $ = cheerio.load(html);
@@ -555,76 +503,91 @@ function findNextPageUrl(html, baseUrl) {
 }
 
 /**
- * STRATEGY 4: Browser fallback (LAST RESORT)
- * Only used if HTTP methods fail
+ * Playwright listing fetch (bypass blocking), then parse HTML or captured JSON.
  */
-async function extractJobsViaBrowser(searchUrl, proxyConfiguration) {
-    log.warning('Strategy 4: All HTTP methods failed. Using browser fallback (slower)...');
+async function fetchListingWithBrowser(searchUrl, proxyConfiguration) {
+    const proxyUrl = await proxyConfiguration.newUrl();
+    const baseUrl = new URL(searchUrl).origin;
+    const networkPayloads = [];
+    const result = { jobs: [], html: '', cookies: [], method: 'Browser-HTML', baseUrl };
 
-    try {
-        const proxyUrl = await proxyConfiguration.newUrl();
-        let totalJobs = [];
-        let extractionMethod = 'Browser';
+    const crawler = new PlaywrightCrawler({
+        proxyConfiguration,
+        maxRequestsPerCrawl: 1,
+        maxConcurrency: 1,
+        navigationTimeoutSecs: 45,
+        requestHandlerTimeoutSecs: 120,
+        launchContext: {
+            launcher: firefox,
+            launchOptions: await camoufoxLaunchOptions({
+                headless: true,
+                proxy: proxyUrl,
+                geoip: true,
+                os: 'windows',
+                locale: 'es-ES',
+                screen: {
+                    minWidth: 1024,
+                    maxWidth: 1920,
+                    minHeight: 768,
+                    maxHeight: 1080,
+                },
+            }),
+        },
 
-        const crawler = new PlaywrightCrawler({
-            proxyConfiguration,
-            maxRequestsPerCrawl: 10,
-            maxConcurrency: 1,
-            navigationTimeoutSecs: 45,
-            requestHandlerTimeoutSecs: 120,
-            launchContext: {
-                launcher: firefox,
-                launchOptions: await camoufoxLaunchOptions({
-                    headless: true,
-                    proxy: proxyUrl,
-                    geoip: true,
-                    os: 'windows',
-                    locale: 'es-ES',
-                    screen: {
-                        minWidth: 1024,
-                        maxWidth: 1920,
-                        minHeight: 768,
-                        maxHeight: 1080,
-                    },
-                }),
-            },
+        async requestHandler({ page, request }) {
+            log.info(`Browser: Processing ${request.url}`);
 
-            async requestHandler({ page, request }) {
-                log.info(`Browser: Processing ${request.url}`);
-
+            page.on('response', async (response) => {
                 try {
-                    await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-                    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-
-                    const html = await page.content();
-                    const baseUrl = new URL(request.url).origin;
-
-                    // Try extraction methods
-                    let result = await extractJobsViaHTML(html, baseUrl);
-                    if (result.jobs.length === 0) {
-                        result = extractJobsViaJsonLD(html);
-                    }
-
-                    totalJobs.push(...result.jobs);
-                    log.info(`Browser: Extracted ${result.jobs.length} jobs`);
-
-                } catch (error) {
-                    log.error(`Browser request failed: ${error.message}`);
+                    const ct = response.headers()['content-type'] || '';
+                    const isJson = ct.includes('application/json');
+                    const url = response.url();
+                    if (!isJson) return;
+                    if (!/api|search|ofertas|jobs|empleos/i.test(url)) return;
+                    const data = await response.json().catch(() => null);
+                    if (data) networkPayloads.push(data);
+                } catch {
+                    // ignore capture errors
                 }
-            },
+            });
 
-            async failedRequestHandler({ request }, error) {
-                log.error(`Browser request failed: ${request.url} - ${error.message}`);
+            await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+
+            result.html = await page.content();
+            result.cookies = await page.context().cookies();
+
+            // Prefer JSON payloads if found
+            for (const payload of networkPayloads) {
+                const fromApi = extractJobsFromAPIResponse(payload);
+                if (fromApi.length > 0) {
+                    result.jobs.push(...fromApi.map(j => ({ ...j, url: normalizeUrl(j.url, baseUrl) })));
+                    result.method = 'Browser-API';
+                }
             }
-        });
 
-        await crawler.run([searchUrl]);
-        return { jobs: totalJobs, method: extractionMethod };
+            if (result.jobs.length === 0 && result.html) {
+                const htmlResult = await extractJobsViaHTML(result.html, baseUrl);
+                result.jobs = htmlResult.jobs;
+                result.method = 'Browser-HTML';
 
-    } catch (error) {
-        log.error(`Browser fallback failed: ${error.message}`);
-        return { jobs: [], method: 'Browser' };
-    }
+                if (result.jobs.length === 0) {
+                    const ldResult = extractJobsViaJsonLD(result.html);
+                    result.jobs = ldResult.jobs;
+                    result.method = ldResult.method;
+                }
+            }
+
+            log.info(`Browser: Extracted ${result.jobs.length} jobs`);
+        },
+
+        async failedRequestHandler({ request }, error) {
+            log.error(`Browser request failed: ${request.url} - ${error.message}`);
+        }
+    });
+
+    await crawler.run([searchUrl]);
+    return result;
 }
 
 /**
@@ -716,21 +679,9 @@ try {
     const proxyUrl = await proxyConfiguration.newUrl();
     const httpClient = createHttpClient(proxyUrl, baseUrl);
 
-    let initialHtml = '';
-    try {
-        const warmup = await httpClient.request({ url: searchUrl, headers: { Referer: baseUrl } });
-        if (warmup.statusCode === 200 && warmup.body) {
-            initialHtml = warmup.body;
-        } else {
-            log.warning(`Warmup request returned status ${warmup.statusCode}`);
-        }
-    } catch (warmErr) {
-        log.debug(`Warmup request failed: ${warmErr.message}`);
-    }
-
     const stats = {
         totalJobs: 0,
-        extractionMethod: 'None',
+        extractionMethod: 'Browser-HTML',
         pagesProcessed: 0,
         startTime: Date.now(),
         timestamp: new Date().toISOString(),
@@ -739,47 +690,29 @@ try {
     const seenUrls = new Set();
     let allJobs = [];
 
-    log.info('=== STARTING EXTRACTION STRATEGY ===');
-    let result = await extractJobsViaAPI(searchUrl, httpClient, baseUrl);
+    log.info('=== STARTING PLAYWRIGHT LISTING FETCH ===');
+    const listingResult = await fetchListingWithBrowser(searchUrl, proxyConfiguration);
+    stats.extractionMethod = listingResult.method;
+    stats.pagesProcessed = 1;
+    allJobs = listingResult.jobs;
+    const initialHtml = listingResult.html;
 
-    if (result.jobs.length > 0) {
-        stats.extractionMethod = result.method;
-        stats.pagesProcessed = 1;
-        allJobs = result.jobs;
-        log.info(`OK Success with ${result.method}: ${result.jobs.length} jobs`);
-    } else {
-        log.info('API extraction failed, trying HTML extraction...');
-
-        try {
-            if (!initialHtml) {
-                const response = await httpClient.request({ url: searchUrl });
-                if (response.statusCode === 200 && response.body) {
-                    initialHtml = response.body;
-                } else {
-                    log.warning(`HTTP request failed with status ${response.statusCode}`);
-                    throw new Error(`HTTP ${response.statusCode}`);
-                }
+    if (listingResult.cookies?.length) {
+        for (const cookie of listingResult.cookies) {
+            try {
+                const domain = cookie.domain || new URL(baseUrl).hostname;
+                const path = cookie.path || '/';
+                const value = `${cookie.name}=${cookie.value}; Domain=${domain}; Path=${path}`;
+                httpClient.cookieJar.setCookieSync(value, baseUrl);
+            } catch {
+                // ignore cookie sync issues
             }
-
-            result = await extractJobsViaHTML(initialHtml, baseUrl);
-            if (result.jobs.length === 0) {
-                result = extractJobsViaJsonLD(initialHtml);
-            }
-
-            stats.extractionMethod = result.method;
-            stats.pagesProcessed = 1;
-            allJobs = result.jobs;
-            log.info(`OK Success with ${result.method}: ${result.jobs.length} jobs`);
-        } catch (httpErr) {
-            log.warning(`HTTP extraction failed: ${httpErr.message}`);
-            result = await extractJobsViaBrowser(searchUrl, proxyConfiguration);
-            stats.extractionMethod = result.method;
-            stats.pagesProcessed = result.jobs.length > 0 ? 1 : 0;
-            allJobs = result.jobs;
         }
     }
 
-    if (allJobs.length < maxJobs && stats.extractionMethod !== 'Browser' && initialHtml) {
+    log.info(`Browser listing yielded ${allJobs.length} jobs with method ${listingResult.method}`);
+
+    if (allJobs.length < maxJobs && initialHtml) {
         log.info(`Attempting pagination... (have ${allJobs.length}/${maxJobs} jobs)`);
 
         const paginatedPages = await fetchNextPages({
@@ -812,7 +745,7 @@ try {
     }
 
     let finalJobs = uniqueJobs;
-    if (includeFullDescription && stats.extractionMethod !== 'Browser' && finalJobs.length > 0) {
+    if (includeFullDescription && finalJobs.length > 0) {
         log.info(`Fetching detail pages for descriptions (${finalJobs.length} jobs)...`);
         finalJobs = await enrichJobsWithDetails(finalJobs, httpClient, baseUrl, 5);
     }
