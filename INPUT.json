@@ -1,0 +1,11 @@
+{
+  "country": "ar",
+  "searchQuery": "administracion-y-oficina",
+  "maxJobs": 50,
+  "includeFullDescription": true,
+  "jobType": "all",
+  "proxyConfiguration": {
+    "useApifyProxy": true,
+    "apifyProxyGroups": ["RESIDENTIAL"]
+  }
+}

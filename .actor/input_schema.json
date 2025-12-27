@@ -1,0 +1,113 @@
+{
+    "title": "Computrabajo Jobs Scraper Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "searchUrl": {
+            "title": "Search URL (Optional)",
+            "type": "string",
+            "description": "Direct Computrabajo search URL to scrape. If provided, other search parameters will be ignored. Example: https://ar.computrabajo.com/empleos-de-administracion-y-oficina",
+            "editor": "textfield",
+            "prefill": "https://ar.computrabajo.com/empleos-de-administracion-y-oficina"
+        },
+        "country": {
+            "title": "Country",
+            "type": "string",
+            "description": "Select the Computrabajo country domain to scrape from",
+            "default": "ar",
+            "enum": [
+                "ar",
+                "mx",
+                "co",
+                "pe",
+                "cl",
+                "ec",
+                "ve",
+                "pa",
+                "cr",
+                "gt",
+                "bo",
+                "uy",
+                "do",
+                "ni"
+            ],
+            "enumTitles": [
+                "Argentina",
+                "Mexico",
+                "Colombia",
+                "Peru",
+                "Chile",
+                "Ecuador",
+                "Venezuela",
+                "Panama",
+                "Costa Rica",
+                "Guatemala",
+                "Bolivia",
+                "Uruguay",
+                "Dominican Republic",
+                "Nicaragua"
+            ]
+        },
+        "searchQuery": {
+            "title": "Search Query / Category",
+            "type": "string",
+            "description": "Job category or keywords to search for (e.g., 'administracion-y-oficina', 'tecnologia-sistemas', 'ventas'). This will be used in the URL path.",
+            "editor": "textfield",
+            "default": "administracion-y-oficina",
+            "prefill": "administracion-y-oficina"
+        },
+        "location": {
+            "title": "City/Location (Optional)",
+            "type": "string",
+            "description": "Specific city or location within the country (optional). Leave empty for nationwide search.",
+            "editor": "textfield"
+        },
+        "maxJobs": {
+            "title": "Maximum Jobs",
+            "type": "integer",
+            "description": "Maximum number of job listings to scrape (0 = unlimited). Default is 50 for optimal performance.",
+            "default": 50,
+            "minimum": 0,
+            "maximum": 10000
+        },
+        "includeFullDescription": {
+            "title": "Include Full Descriptions",
+            "type": "boolean",
+            "description": "Fetch complete job descriptions from detail pages (slower but more comprehensive)",
+            "default": true
+        },
+        "jobType": {
+            "title": "Job Type (Optional)",
+            "type": "string",
+            "description": "Filter by employment type if supported",
+            "enum": [
+                "all",
+                "tiempo-completo",
+                "medio-tiempo",
+                "temporal",
+                "freelance",
+                "practicas"
+            ],
+            "enumTitles": [
+                "All Types",
+                "Full Time",
+                "Part Time",
+                "Temporary",
+                "Freelance",
+                "Internship"
+            ],
+            "default": "all"
+        },
+        "proxyConfiguration": {
+            "title": "Proxy Configuration",
+            "type": "object",
+            "description": "Proxy settings for bypassing anti-bot protection. Residential proxies recommended for Computrabajo.",
+            "editor": "proxy",
+            "default": {
+                "useApifyProxy": true,
+                "apifyProxyGroups": ["RESIDENTIAL"]
+            }
+        }
+    },
+    "required": []
+}

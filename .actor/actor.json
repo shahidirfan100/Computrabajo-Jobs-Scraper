@@ -1,0 +1,22 @@
+{
+    "actorSpecification": 1,
+    "name": "computrabajo-jobs-scraper",
+    "title": "Computrabajo Jobs Scraper",
+    "version": "1.0",
+    "categories": [
+        "BUSINESS",
+        "JOBS"
+    ],
+    "meta": {
+        "templateId": "computrabajo-jobs-scraper",
+        "generatedBy": "Claude Sonnet 4.5",
+        "optimizationLevel": "production-ready",
+        "extractionStrategy": "HTTP-first with intelligent fallbacks"
+    },
+    "input": "./input_schema.json",
+    "output": "./output_schema.json",
+    "storages": {
+        "dataset": "./dataset_schema.json"
+    },
+    "dockerfile": "../Dockerfile"
+}
