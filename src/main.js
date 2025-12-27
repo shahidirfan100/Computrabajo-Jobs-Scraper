@@ -519,10 +519,10 @@ function findNextPageUrl(html, baseUrl) {
 /**
  * Playwright listing fetch (bypass blocking), then parse HTML or captured JSON.
  */
-async function fetchListingWithBrowser(searchUrl, proxyConfiguration) {
+async function fetchListingWithBrowser(searchUrl, proxyConfiguration, maxJobs, maxPages) {
     const proxyUrl = await proxyConfiguration.newUrl();
     const baseUrl = new URL(searchUrl).origin;
-    const networkPayloads = [];
+    let networkPayloads = [];
     const result = { jobs: [], html: '', cookies: [], method: 'Browser-HTML', baseUrl };
 
     const crawler = new PlaywrightCrawler({
@@ -568,31 +568,62 @@ async function fetchListingWithBrowser(searchUrl, proxyConfiguration) {
             await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
             await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
 
-            result.html = await page.content();
+            let pageCount = 0;
+            let collected = [];
+
+            const processPayloads = () => {
+                let added = 0;
+                for (const payload of networkPayloads) {
+                    const fromApi = extractJobsFromAPIResponse(payload);
+                    if (fromApi.length > 0) {
+                        collected.push(...fromApi.map(j => ({ ...j, url: normalizeUrl(j.url, baseUrl) })));
+                        added += fromApi.length;
+                    }
+                }
+                if (added > 0) result.method = 'Browser-API';
+                networkPayloads = [];
+            };
+
+            const processHtml = async () => {
+                const html = await page.content();
+                result.html = html;
+                const ldResult = extractJobsViaJsonLD(html);
+                if (ldResult.jobs.length > 0) {
+                    result.method = 'Browser-JSONLD';
+                    collected.push(...ldResult.jobs);
+                    return;
+                }
+                const htmlResult = await extractJobsViaHTML(html, baseUrl);
+                if (htmlResult.jobs.length > 0) {
+                    result.method = 'Browser-HTML';
+                    collected.push(...htmlResult.jobs);
+                }
+            };
+
+            // First page
+            await processPayloads();
+            await processHtml();
+            pageCount += 1;
+
+            // Paginate via "Next" button (ajax/LinkedIn style)
+            while (collected.length < maxJobs && pageCount < maxPages) {
+                const nextButton =
+                    (await page.$('span.b_primary.w48.buildLink.cp')) ||
+                    (await page.$('span.b_primary.w48.buildLink.cp:not([disabled])'));
+                if (!nextButton) break;
+
+                await nextButton.click();
+                await page.waitForTimeout(800);
+                await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+
+                await processPayloads();
+                await processHtml();
+                pageCount += 1;
+            }
+
+            result.jobs = collected;
             result.cookies = await page.context().cookies();
-
-            // Prefer JSON payloads if found
-            for (const payload of networkPayloads) {
-                const fromApi = extractJobsFromAPIResponse(payload);
-                if (fromApi.length > 0) {
-                    result.jobs.push(...fromApi.map(j => ({ ...j, url: normalizeUrl(j.url, baseUrl) })));
-                    result.method = 'Browser-API';
-                }
-            }
-
-            if (result.jobs.length === 0 && result.html) {
-                const htmlResult = await extractJobsViaHTML(result.html, baseUrl);
-                result.jobs = htmlResult.jobs;
-                result.method = 'Browser-HTML';
-
-                if (result.jobs.length === 0) {
-                    const ldResult = extractJobsViaJsonLD(result.html);
-                    result.jobs = ldResult.jobs;
-                    result.method = ldResult.method;
-                }
-            }
-
-            log.info(`Browser: Extracted ${result.jobs.length} jobs`);
+            log.info(`Browser: Extracted ${result.jobs.length} jobs across ${pageCount} page(s)`);
         },
 
         async failedRequestHandler({ request }, error) {
@@ -719,7 +750,7 @@ try {
     let allJobs = [];
 
     log.info('=== STARTING PLAYWRIGHT LISTING FETCH ===');
-    const listingResult = await fetchListingWithBrowser(searchUrl, proxyConfiguration);
+    const listingResult = await fetchListingWithBrowser(searchUrl, proxyConfiguration, maxJobs, Math.ceil(maxJobs / 20) + 2);
     stats.extractionMethod = listingResult.method;
     stats.pagesProcessed = 1;
     allJobs = listingResult.jobs;
