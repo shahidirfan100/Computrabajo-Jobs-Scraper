@@ -52,7 +52,7 @@ function createHttpClient(proxyUrl, baseUrl) {
         const timeout =
             typeof options.timeout === 'number'
                 ? { request: options.timeout }
-                : { request: 15000, ...(options.timeout || {}) };
+                : { request: 12000, ...(options.timeout || {}) };
 
         return gotScraping({
             http2: true,
@@ -60,7 +60,7 @@ function createHttpClient(proxyUrl, baseUrl) {
             cookieJar,
             throwHttpErrors: false,
             timeout,
-            retry: { limit: 2 },
+            retry: { limit: 1 },
             headers: { ...defaultHeaders, ...(options.headers || {}) },
             ...options,
         });
@@ -408,9 +408,12 @@ function parseJobDetail(html, baseUrl) {
     const jsonJob = findFirstJobPosting($);
     const fromJson = jsonJob ? parseJobPosting(jsonJob) : {};
 
-    const descEl = $('[itemprop="description"], .bVj, .box_detail, .description, .fs16.fc_base.mt20').first();
-    const descriptionHtml = fromJson.descriptionHtml || descEl.html() || '';
-    const descriptionText = fromJson.descriptionText || descEl.text().trim();
+    const descEl = $(
+        '[itemprop="description"], .bVj, .box_detail, .description, .fs16.fc_base.mt20, #descripcion-oferta, .bWord',
+    ).first();
+    const metaDesc = $('meta[name="description"]').attr('content') || '';
+    const descriptionHtml = fromJson.descriptionHtml || descEl.html() || metaDesc;
+    const descriptionText = fromJson.descriptionText || descEl.text().trim() || metaDesc;
 
     const company =
         fromJson.company ||
@@ -420,9 +423,12 @@ function parseJobDetail(html, baseUrl) {
         fromJson.location ||
         $('.fc_base.fs13, .fs13.fc_aux:not(.t_date), .tag_base, [data-qa="location"]').first().text().trim();
 
-    const postedDate = fromJson.postedDate || $('.fs13.fc_aux.t_date, .t_date, time').first().text().trim();
+    const postedDate =
+        fromJson.postedDate ||
+        $('.fs13.fc_aux.t_date, .t_date, time, [data-qa="postedDate"]').first().text().trim();
     const salary =
-        fromJson.salary || $('.bCS.b-salary, .fs16.fc_base:not(.mt5), [data-qa="salary"]').first().text().trim();
+        fromJson.salary ||
+        $('.bCS.b-salary, .fs16.fc_base:not(.mt5), [data-qa="salary"], .tag_base.salary').first().text().trim();
 
     return {
         descriptionHtml,
@@ -445,6 +451,7 @@ async function enrichJobWithDetail(job, httpClient, baseUrl) {
             url: detailUrl,
             headers: {
                 Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
                 Referer: baseUrl,
             },
         });
@@ -469,7 +476,7 @@ async function enrichJobWithDetail(job, httpClient, baseUrl) {
     }
 }
 
-async function enrichJobsWithDetails(jobs, httpClient, baseUrl, maxConcurrency = 5) {
+async function enrichJobsWithDetails(jobs, httpClient, baseUrl, maxConcurrency = 8) {
     const enriched = [];
     let index = 0;
 
@@ -490,7 +497,14 @@ async function enrichJobsWithDetails(jobs, httpClient, baseUrl, maxConcurrency =
 
 function findNextPageUrl(html, baseUrl) {
     const $ = cheerio.load(html);
-    const selectors = ['a[aria-label*="Siguiente"]', 'a[rel="next"]', 'a[href*="?p="].page-link', 'a.bpagSig'];
+    const selectors = [
+        'a[aria-label*="Siguiente"]',
+        'a[rel="next"]',
+        'a[href*="?p="].page-link',
+        'a.bpagSig',
+        '.pagination a.next',
+        'a[title*="Siguiente"]',
+    ];
 
     for (const selector of selectors) {
         const href = $(selector).attr('href');
@@ -623,13 +637,26 @@ function buildSearchUrl(input) {
 /**
  * Handle pagination by following "next" links
  */
-async function fetchNextPages({ firstHtml, startUrl, baseUrl, httpClient, maxPages }) {
+function buildPageUrlWithParam(url, pageNum) {
+    const u = new URL(url);
+    u.searchParams.set('p', String(pageNum));
+    return u.toString();
+}
+
+async function fetchNextPages({ firstHtml, startUrl, baseUrl, httpClient, maxPages, maxJobs, currentCount }) {
     const pages = [];
     const visited = new Set([startUrl]);
     let currentHtml = firstHtml;
+    let currentUrl = startUrl;
 
-    for (let i = 1; i < maxPages; i++) {
-        const nextUrl = findNextPageUrl(currentHtml, baseUrl);
+    for (let i = 2; i <= maxPages; i++) {
+        if (currentCount >= maxJobs) break;
+
+        let nextUrl = findNextPageUrl(currentHtml, baseUrl);
+        if (!nextUrl) {
+            nextUrl = buildPageUrlWithParam(startUrl, i);
+        }
+
         if (!nextUrl || visited.has(nextUrl)) break;
         visited.add(nextUrl);
 
@@ -639,6 +666,7 @@ async function fetchNextPages({ firstHtml, startUrl, baseUrl, httpClient, maxPag
 
             pages.push({ url: nextUrl, html: response.body });
             currentHtml = response.body;
+            currentUrl = nextUrl;
         } catch (err) {
             log.debug(`Failed to fetch page ${nextUrl}: ${err.message}`);
             break;
@@ -720,7 +748,9 @@ try {
             startUrl: searchUrl,
             baseUrl,
             httpClient,
-            maxPages: Math.ceil(maxJobs / 20),
+            maxPages: Math.ceil(maxJobs / 20) + 2,
+            maxJobs,
+            currentCount: allJobs.length,
         });
 
         for (const page of paginatedPages) {
@@ -747,7 +777,7 @@ try {
     let finalJobs = uniqueJobs;
     if (includeFullDescription && finalJobs.length > 0) {
         log.info(`Fetching detail pages for descriptions (${finalJobs.length} jobs)...`);
-        finalJobs = await enrichJobsWithDetails(finalJobs, httpClient, baseUrl, 5);
+        finalJobs = await enrichJobsWithDetails(finalJobs, httpClient, baseUrl, Math.min(10, finalJobs.length));
     }
 
     if (finalJobs.length > 0) {
