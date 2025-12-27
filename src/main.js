@@ -1,13 +1,77 @@
 import { Actor, log } from 'apify';
-import { CheerioCrawler, PlaywrightCrawler } from 'crawlee';
+import { PlaywrightCrawler } from 'crawlee';
 import { launchOptions as camoufoxLaunchOptions } from 'camoufox-js';
 import { firefox } from 'playwright';
 import * as cheerio from 'cheerio';
 import { gotScraping } from 'got-scraping';
+import { CookieJar } from 'tough-cookie';
+
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+];
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function buildStealthHeaders({ baseUrl, referer, userAgent }) {
+    return {
+        'User-Agent': userAgent,
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-User': '?1',
+        Referer: referer || baseUrl,
+        Origin: baseUrl,
+    };
+}
+
+function normalizeUrl(url, baseUrl) {
+    if (!url) return '';
+    try {
+        return new URL(url, baseUrl).toString();
+    } catch {
+        return url;
+    }
+}
+
+function createHttpClient(proxyUrl, baseUrl) {
+    const cookieJar = new CookieJar();
+    const userAgent = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+    const defaultHeaders = buildStealthHeaders({ baseUrl, userAgent });
+
+    const request = async (options = {}) => {
+        const jitter = 200 + Math.random() * 400;
+        await sleep(jitter);
+
+        const timeout =
+            typeof options.timeout === 'number'
+                ? { request: options.timeout }
+                : { request: 15000, ...(options.timeout || {}) };
+
+        return gotScraping({
+            http2: true,
+            proxyUrl,
+            cookieJar,
+            throwHttpErrors: false,
+            timeout,
+            retry: { limit: 2, backoff: 500 },
+            headers: { ...defaultHeaders, ...(options.headers || {}) },
+            ...options,
+        });
+    };
+
+    return { request, cookieJar, userAgent };
+}
 
 // ============================================================================
 // COMPUTRABAJO JOBS SCRAPER - PRODUCTION READY
-// Strategy: HTTP First → HTML Parsing → JSON-LD → Browser Fallback
+// Strategy: HTTP First -> HTML Parsing -> JSON-LD -> Browser Fallback
 // ============================================================================
 
 await Actor.init();
@@ -15,10 +79,10 @@ await Actor.init();
 /**
  * Parse job listing from HTML element
  */
-function parseJobFromElement($, $el) {
+function parseJobFromElement($, $el, baseUrl) {
     try {
         // Title and URL
-        const titleSelectors = ['h2 a', 'h3 a', '.js-o-link', 'a[data-title]'];
+        const titleSelectors = ['h2 a', 'h3 a', '.js-o-link', 'a[data-title]', '.jtitle', 'a[href*="/ofertas-"]'];
         let title = '';
         let url = '';
 
@@ -26,20 +90,20 @@ function parseJobFromElement($, $el) {
             const el = $el.find(selector).first();
             if (el.length && el.text().trim()) {
                 title = el.text().trim();
-                url = el.attr('href') || '';
+                url = normalizeUrl(el.attr('href') || '', baseUrl);
                 break;
             }
         }
 
         if (!title) {
-            title = $el.attr('data-title') || '';
+            title = $el.attr('data-title') || $el.attr('title') || '';
         }
 
         if (!title) return null;
 
         // Company
         let company = '';
-        const companySelectors = ['.fs16.fc_base.mt5', '.company', 'p.fs16.fc_base'];
+        const companySelectors = ['.fs16.fc_base.mt5', '.company', 'p.fs16.fc_base', '.fs16.fc_base a', '.js-o-link[data-company]'];
         for (const selector of companySelectors) {
             const el = $el.find(selector).first();
             if (el.length && el.text().trim()) {
@@ -50,7 +114,7 @@ function parseJobFromElement($, $el) {
 
         // Location
         let location = '';
-        const locationSelectors = ['.fs13.fc_base', '.location', 'p.fs13'];
+        const locationSelectors = ['.fs13.fc_base', '.location', 'p.fs13', '.tag_base', '.fs13.fc_aux:not(.t_date)'];
         for (const selector of locationSelectors) {
             const el = $el.find(selector).first();
             if (el.length && el.text().trim()) {
@@ -61,7 +125,7 @@ function parseJobFromElement($, $el) {
 
         // Salary
         let salary = 'Not specified';
-        const salarySelectors = ['.fs16.fc_base', '.salary', 'p.fs16:not(.mt5)'];
+        const salarySelectors = ['.fs16.fc_base', '.salary', 'p.fs16:not(.mt5)', '.bCS.b-salary'];
         for (const selector of salarySelectors) {
             const el = $el.find(selector).first();
             const text = el.text().trim();
@@ -73,7 +137,7 @@ function parseJobFromElement($, $el) {
 
         // Description
         let description = '';
-        const descSelectors = ['.fs13.fc_base.mt10', '.description', 'p.fs13.fc_base'];
+        const descSelectors = ['.fs13.fc_base.mt10', '.description', 'p.fs13.fc_base', 'p.fs13.fc_base.mt5'];
         for (const selector of descSelectors) {
             const el = $el.find(selector).first();
             if (el.length && el.text().trim()) {
@@ -84,7 +148,7 @@ function parseJobFromElement($, $el) {
 
         // Posted date
         let postedDate = '';
-        const dateSelectors = ['.fs13.fc_aux', '.date', 'p.fs13.fc_aux'];
+        const dateSelectors = ['.fs13.fc_aux', '.date', 'p.fs13.fc_aux', '.fs13.fc_aux.t_date'];
         for (const selector of dateSelectors) {
             const el = $el.find(selector).first();
             if (el.length && el.text().trim()) {
@@ -102,7 +166,7 @@ function parseJobFromElement($, $el) {
             postedDate,
             descriptionHtml: description,
             descriptionText: description,
-            url: url.startsWith('http') ? url : url.startsWith('/') ? url : `/${url}`,
+            url,
             scrapedAt: new Date().toISOString()
         };
     } catch (err) {
@@ -115,42 +179,41 @@ function parseJobFromElement($, $el) {
  * STRATEGY 1: Extract jobs via internal API (HTTP + JSON)
  * Most efficient - no browser needed, pure JSON parsing
  */
-async function extractJobsViaAPI(url, proxyUrl) {
+async function extractJobsViaAPI(url, httpClient, baseUrl) {
     log.info('Strategy 1: Attempting to extract jobs via internal API (HTTP + JSON)');
 
     try {
-        // Try common API endpoints
         const apiEndpoints = [
-            url.replace('/empleos-de-', '/api/search?q=') + '&limit=100',
-            url + '?format=json',
-            new URL(url).origin + '/api/jobs',
+            `${url.replace('/empleos-de-', '/api/search?q=')}&limit=100`,
+            `${url}?format=json`,
+            `${new URL(url).origin}/api/jobs`,
         ];
 
         for (const endpoint of apiEndpoints) {
             try {
-                const response = await gotScraping({
+                const response = await httpClient.request({
                     url: endpoint,
-                    proxyUrl,
                     headers: {
-                        'Accept': 'application/json',
+                        Accept: 'application/json',
                         'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+                        Referer: baseUrl,
                     },
-                    timeout: { request: 10000 },
-                    retry: { limit: 1 },
                 });
 
-                if (response.statusCode === 200) {
+                if (response.statusCode === 200 && response.body) {
                     try {
-                        const data = JSON.parse(response.body);
+                        const data = typeof response.body === 'string' ? JSON.parse(response.body) : response.body;
                         const jobs = extractJobsFromAPIResponse(data);
 
                         if (jobs.length > 0) {
-                            log.info(`✓ API extraction successful: ${jobs.length} jobs from ${endpoint}`);
+                            log.info(`OK API extraction successful: ${jobs.length} jobs from ${endpoint}`);
                             return { jobs, method: 'API' };
                         }
                     } catch (parseErr) {
                         log.debug(`Failed to parse JSON from ${endpoint}: ${parseErr.message}`);
                     }
+                } else if (response.statusCode === 403) {
+                    log.warningOnce(`API endpoint blocked with 403: ${endpoint}`);
                 }
             } catch (err) {
                 log.debug(`API endpoint failed: ${endpoint} - ${err.message}`);
@@ -233,24 +296,18 @@ async function extractJobsViaHTML(html, baseUrl) {
         for (const selector of selectors) {
             jobElements = $(selector);
             if (jobElements.length > 0) {
-                log.info(`✓ Found ${jobElements.length} job cards using selector: ${selector}`);
+                log.info(`Found ${jobElements.length} job cards using selector: ${selector}`);
                 break;
             }
         }
 
         jobElements.each((_, el) => {
-            const job = parseJobFromElement($, $(el));
-            if (job) {
-                // Complete URL
-                if (job.url && !job.url.startsWith('http')) {
-                    job.url = job.url.startsWith('/') ? `${baseUrl}${job.url}` : `${baseUrl}/${job.url}`;
-                }
-                jobs.push(job);
-            }
+            const job = parseJobFromElement($, $(el), baseUrl);
+            if (job) jobs.push(job);
         });
 
         if (jobs.length > 0) {
-            log.info(`✓ HTML extraction successful: ${jobs.length} jobs`);
+            log.info(`HTML extraction successful: ${jobs.length} jobs`);
         }
 
         return { jobs, method: 'HTML' };
@@ -303,7 +360,7 @@ function extractJobsViaJsonLD(html) {
         });
 
         if (jobs.length > 0) {
-            log.info(`✓ JSON-LD extraction successful: ${jobs.length} jobs`);
+            log.info(`OK JSON-LD extraction successful: ${jobs.length} jobs`);
         }
 
         return { jobs, method: 'JSON-LD' };
@@ -357,6 +414,144 @@ function parseJobPosting(jobData) {
 function stripHtml(html) {
     if (!html) return '';
     return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function findFirstJobPosting($) {
+    let found = null;
+
+    $('script[type="application/ld+json"]').each((_, script) => {
+        if (found) return;
+        try {
+            const data = JSON.parse($(script).html() || '{}');
+
+            function scan(obj) {
+                if (!obj || found) return;
+
+                if (Array.isArray(obj)) {
+                    for (const item of obj) scan(item);
+                    return;
+                }
+
+                if (obj['@type'] === 'JobPosting') {
+                    found = obj;
+                    return;
+                }
+
+                if (obj['@graph']) {
+                    scan(obj['@graph']);
+                }
+
+                if (obj['@type'] === 'ItemList' && obj.itemListElement) {
+                    scan(obj.itemListElement);
+                }
+            }
+
+            scan(data);
+        } catch {
+            // Ignore JSON-LD parse issues on detail pages
+        }
+    });
+
+    return found;
+}
+
+function parseJobDetail(html, baseUrl) {
+    const $ = cheerio.load(html);
+    const jsonJob = findFirstJobPosting($);
+    const fromJson = jsonJob ? parseJobPosting(jsonJob) : {};
+
+    const descEl = $('[itemprop="description"], .bVj, .box_detail, .description, .fs16.fc_base.mt20').first();
+    const descriptionHtml = fromJson.descriptionHtml || descEl.html() || '';
+    const descriptionText = fromJson.descriptionText || descEl.text().trim();
+
+    const company =
+        fromJson.company ||
+        $('.fc_base.fs20, .fc_base.mt5.fs16, a[data-company], a[data-accion*="Company"]').first().text().trim();
+
+    const location =
+        fromJson.location ||
+        $('.fc_base.fs13, .fs13.fc_aux:not(.t_date), .tag_base, [data-qa="location"]').first().text().trim();
+
+    const postedDate = fromJson.postedDate || $('.fs13.fc_aux.t_date, .t_date, time').first().text().trim();
+    const salary =
+        fromJson.salary || $('.bCS.b-salary, .fs16.fc_base:not(.mt5), [data-qa="salary"]').first().text().trim();
+
+    return {
+        descriptionHtml,
+        descriptionText,
+        company: company || fromJson.company || '',
+        location: location || fromJson.location || '',
+        salary: salary || fromJson.salary || 'Not specified',
+        jobType: fromJson.jobType || 'Not specified',
+        postedDate,
+        url: normalizeUrl(fromJson.url || '', baseUrl),
+    };
+}
+
+async function enrichJobWithDetail(job, httpClient, baseUrl) {
+    const detailUrl = normalizeUrl(job.url, baseUrl);
+    if (!detailUrl) return job;
+
+    try {
+        const response = await httpClient.request({
+            url: detailUrl,
+            headers: {
+                Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                Referer: baseUrl,
+            },
+        });
+
+        if (response.statusCode >= 400 || !response.body) return job;
+
+        const detail = parseJobDetail(response.body, baseUrl);
+        return {
+            ...job,
+            url: detailUrl,
+            descriptionHtml: detail.descriptionHtml || job.descriptionHtml,
+            descriptionText: detail.descriptionText || job.descriptionText,
+            company: detail.company || job.company,
+            location: detail.location || job.location,
+            salary: detail.salary || job.salary,
+            jobType: detail.jobType || job.jobType,
+            postedDate: detail.postedDate || job.postedDate,
+        };
+    } catch (err) {
+        log.debug(`Failed to enrich job ${detailUrl}: ${err.message}`);
+        return job;
+    }
+}
+
+async function enrichJobsWithDetails(jobs, httpClient, baseUrl, maxConcurrency = 5) {
+    const enriched = [];
+    let index = 0;
+
+    const worker = async () => {
+        while (index < jobs.length) {
+            const current = jobs[index];
+            index += 1;
+            const result = await enrichJobWithDetail(current, httpClient, baseUrl);
+            enriched.push(result);
+        }
+    };
+
+    const workers = Array.from({ length: Math.min(maxConcurrency, jobs.length) }, () => worker());
+    await Promise.all(workers);
+
+    return enriched;
+}
+
+function findNextPageUrl(html, baseUrl) {
+    const $ = cheerio.load(html);
+    const selectors = ['a[aria-label*="Siguiente"]', 'a[rel="next"]', 'a[href*="?p="].page-link', 'a.bpagSig'];
+
+    for (const selector of selectors) {
+        const href = $(selector).attr('href');
+        if (href) {
+            return normalizeUrl(href, baseUrl);
+        }
+    }
+
+    return '';
 }
 
 /**
@@ -449,47 +644,40 @@ function buildSearchUrl(input) {
         url += `-en-${locationSlug}`;
     }
 
+    const params = new URLSearchParams();
+    if (input.jobType && input.jobType !== 'all') {
+        params.set('trabajo', input.jobType);
+    }
+
+    const query = params.toString();
+    if (query) {
+        url += url.includes('?') ? `&${query}` : `?${query}`;
+    }
+
     return url;
 }
 
 /**
- * Handle pagination
+ * Handle pagination by following "next" links
  */
-async function fetchNextPages(baseUrl, proxyUrl, currentPageNum, maxPages) {
+async function fetchNextPages({ firstHtml, startUrl, baseUrl, httpClient, maxPages }) {
     const pages = [];
+    const visited = new Set([startUrl]);
+    let currentHtml = firstHtml;
 
-    for (let page = currentPageNum + 1; page <= maxPages && page <= currentPageNum + 5; page++) {
-        const url = `${baseUrl}?p=${page}`;
+    for (let i = 1; i < maxPages; i++) {
+        const nextUrl = findNextPageUrl(currentHtml, baseUrl);
+        if (!nextUrl || visited.has(nextUrl)) break;
+        visited.add(nextUrl);
 
         try {
-            const response = await gotScraping({
-                url,
-                proxyUrl,
-                headers: {
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                },
-                timeout: { request: 10000 },
-                retry: { limit: 1 },
-            });
+            const response = await httpClient.request({ url: nextUrl });
+            if (response.statusCode !== 200 || !response.body) break;
 
-            if (response.statusCode === 200) {
-                const $ = cheerio.load(response.body);
-                const jobElements = $('article.box_offer, div.bRS.bClick, article[data-id]');
-
-                if (jobElements.length > 0) {
-                    pages.push({ url, html: response.body });
-                } else {
-                    log.info(`No jobs on page ${page}, stopping pagination`);
-                    break;
-                }
-            } else {
-                log.info(`Page ${page} returned ${response.statusCode}, stopping pagination`);
-                break;
-            }
+            pages.push({ url: nextUrl, html: response.body });
+            currentHtml = response.body;
         } catch (err) {
-            log.debug(`Failed to fetch page ${page}: ${err.message}`);
+            log.debug(`Failed to fetch page ${nextUrl}: ${err.message}`);
             break;
         }
     }
@@ -503,138 +691,143 @@ async function fetchNextPages(baseUrl, proxyUrl, currentPageNum, maxPages) {
 try {
     const input = await Actor.getInput() || {};
 
-    log.info('🚀 Starting Computrabajo Jobs Scraper (Production Ready)', {
-        country: input.country,
-        searchQuery: input.searchQuery,
-        maxJobs: input.maxJobs
-    });
-
-    // Validation
-    const maxJobs = Math.min(input.maxJobs ?? 50, 10000);
-    if (maxJobs < 0) throw new Error('maxJobs must be non-negative');
+    const maxJobsInput = input.maxJobs ?? 50;
+    if (maxJobsInput < 0) throw new Error('maxJobs must be non-negative');
+    const maxJobs = maxJobsInput === 0 ? 10000 : Math.min(maxJobsInput, 10000);
+    const includeFullDescription = input.includeFullDescription !== false;
 
     const searchUrl = buildSearchUrl(input);
     const baseUrl = new URL(searchUrl).origin;
 
-    log.info(`Search URL: ${searchUrl}`);
+    log.info('Starting Computrabajo Jobs Scraper (Production Ready)', {
+        country: input.country,
+        searchQuery: input.searchQuery,
+        maxJobs,
+        includeFullDescription,
+    });
 
-    // Proxy configuration
     const proxyConfiguration = await Actor.createProxyConfiguration(
         input.proxyConfiguration || {
             useApifyProxy: true,
-            apifyProxyGroups: ['RESIDENTIAL']
-        }
+            apifyProxyGroups: ['RESIDENTIAL'],
+        },
     );
 
     const proxyUrl = await proxyConfiguration.newUrl();
+    const httpClient = createHttpClient(proxyUrl, baseUrl);
 
-    // Statistics
+    let initialHtml = '';
+    try {
+        const warmup = await httpClient.request({ url: searchUrl, headers: { Referer: baseUrl } });
+        if (warmup.statusCode === 200 && warmup.body) {
+            initialHtml = warmup.body;
+        } else {
+            log.warning(`Warmup request returned status ${warmup.statusCode}`);
+        }
+    } catch (warmErr) {
+        log.debug(`Warmup request failed: ${warmErr.message}`);
+    }
+
     const stats = {
         totalJobs: 0,
         extractionMethod: 'None',
         pagesProcessed: 0,
         startTime: Date.now(),
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
     };
 
     const seenUrls = new Set();
     let allJobs = [];
 
-    // ========================================================================
-    // PRIORITY 1: Try HTTP + JSON API extraction
-    // ========================================================================
     log.info('=== STARTING EXTRACTION STRATEGY ===');
-    let result = await extractJobsViaAPI(searchUrl, proxyUrl);
+    let result = await extractJobsViaAPI(searchUrl, httpClient, baseUrl);
 
     if (result.jobs.length > 0) {
         stats.extractionMethod = result.method;
         stats.pagesProcessed = 1;
-        log.info(`✓ Success with ${result.method}: ${result.jobs.length} jobs`);
         allJobs = result.jobs;
+        log.info(`OK Success with ${result.method}: ${result.jobs.length} jobs`);
     } else {
-        // ====================================================================
-        // PRIORITY 2: Try HTTP + HTML parsing with got-scraping
-        // ====================================================================
         log.info('API extraction failed, trying HTML extraction...');
 
         try {
-            const response = await gotScraping({
-                url: searchUrl,
-                proxyUrl,
-                headers: {
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                },
-                timeout: { request: 15000 },
-                retry: { limit: 2 },
-            });
-
-            if (response.statusCode === 200) {
-                result = await extractJobsViaHTML(response.body, baseUrl);
-
-                if (result.jobs.length === 0) {
-                    result = extractJobsViaJsonLD(response.body);
+            if (!initialHtml) {
+                const response = await httpClient.request({ url: searchUrl });
+                if (response.statusCode === 200 && response.body) {
+                    initialHtml = response.body;
+                } else {
+                    log.warning(`HTTP request failed with status ${response.statusCode}`);
+                    throw new Error(`HTTP ${response.statusCode}`);
                 }
-
-                stats.extractionMethod = result.method;
-                stats.pagesProcessed = 1;
-                allJobs = result.jobs;
-                log.info(`✓ Success with ${result.method}: ${result.jobs.length} jobs`);
-            } else {
-                log.warning(`HTTP request failed with status ${response.statusCode}`);
-                throw new Error(`HTTP ${response.statusCode}`);
             }
+
+            result = await extractJobsViaHTML(initialHtml, baseUrl);
+            if (result.jobs.length === 0) {
+                result = extractJobsViaJsonLD(initialHtml);
+            }
+
+            stats.extractionMethod = result.method;
+            stats.pagesProcessed = 1;
+            allJobs = result.jobs;
+            log.info(`OK Success with ${result.method}: ${result.jobs.length} jobs`);
         } catch (httpErr) {
             log.warning(`HTTP extraction failed: ${httpErr.message}`);
-
-            // ================================================================
-            // PRIORITY 4: Browser fallback (last resort)
-            // ================================================================
             result = await extractJobsViaBrowser(searchUrl, proxyConfiguration);
             stats.extractionMethod = result.method;
+            stats.pagesProcessed = result.jobs.length > 0 ? 1 : 0;
             allJobs = result.jobs;
         }
     }
 
-    // Handle pagination
-    if (allJobs.length < maxJobs && stats.extractionMethod !== 'Browser') {
+    if (allJobs.length < maxJobs && stats.extractionMethod !== 'Browser' && initialHtml) {
         log.info(`Attempting pagination... (have ${allJobs.length}/${maxJobs} jobs)`);
 
-        const paginatedPages = await fetchNextPages(searchUrl, proxyUrl, 1, Math.ceil(maxJobs / 20));
+        const paginatedPages = await fetchNextPages({
+            firstHtml: initialHtml,
+            startUrl: searchUrl,
+            baseUrl,
+            httpClient,
+            maxPages: Math.ceil(maxJobs / 20),
+        });
 
         for (const page of paginatedPages) {
             if (allJobs.length >= maxJobs) break;
 
-            const result = await extractJobsViaHTML(page.html, baseUrl);
-            allJobs.push(...result.jobs);
-            stats.pagesProcessed++;
-            log.info(`Pagination: Page ${stats.pagesProcessed} - ${result.jobs.length} jobs`);
+            const pageResult = await extractJobsViaHTML(page.html, baseUrl);
+            allJobs.push(...pageResult.jobs);
+            stats.pagesProcessed += 1;
+            log.info(`Pagination: Page ${stats.pagesProcessed} - ${pageResult.jobs.length} jobs`);
         }
     }
 
-    // Deduplicate
     const uniqueJobs = [];
     for (const job of allJobs) {
-        if (!seenUrls.has(job.url)) {
-            seenUrls.add(job.url);
-            uniqueJobs.push(job);
-            if (uniqueJobs.length >= maxJobs) break;
-        }
+        const normalizedUrl = normalizeUrl(job.url, baseUrl);
+        if (!normalizedUrl) continue;
+        if (seenUrls.has(normalizedUrl)) continue;
+
+        seenUrls.add(normalizedUrl);
+        uniqueJobs.push({ ...job, url: normalizedUrl });
+        if (uniqueJobs.length >= maxJobs) break;
     }
 
-    // Save jobs
-    if (uniqueJobs.length > 0) {
-        await Actor.pushData(uniqueJobs);
-        stats.totalJobs = uniqueJobs.length;
-        log.info(`✓ Saved ${uniqueJobs.length} jobs to dataset`);
+    let finalJobs = uniqueJobs;
+    if (includeFullDescription && stats.extractionMethod !== 'Browser' && finalJobs.length > 0) {
+        log.info(`Fetching detail pages for descriptions (${finalJobs.length} jobs)...`);
+        finalJobs = await enrichJobsWithDetails(finalJobs, httpClient, baseUrl, 5);
     }
 
-    // Statistics
+    if (finalJobs.length > 0) {
+        await Actor.pushData(finalJobs);
+        stats.totalJobs = finalJobs.length;
+        log.info(`OK Saved ${finalJobs.length} jobs to dataset`);
+    }
+
     stats.duration = `${Math.round((Date.now() - stats.startTime) / 1000)}s`;
+    stats.detailPagesFetched = includeFullDescription && stats.extractionMethod !== 'Browser' && finalJobs.length > 0;
     await Actor.setValue('statistics', stats);
 
-    log.info('✓ Scraping completed successfully!', stats);
+    log.info('OK Scraping completed successfully!', stats);
 
 } catch (error) {
     log.exception(error, 'Fatal error');
@@ -642,3 +835,5 @@ try {
 }
 
 await Actor.exit();
+
+

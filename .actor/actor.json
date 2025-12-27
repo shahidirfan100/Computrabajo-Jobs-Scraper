@@ -10,7 +10,7 @@
     ],
     "meta": {
         "templateId": "computrabajo-jobs-scraper",
-        "generatedBy": "Claude Sonnet 4.5",
+        "generatedBy": "GPT-5",
         "optimizationLevel": "production-ready",
         "extractionStrategy": "HTTP-first with intelligent fallbacks"
     },
