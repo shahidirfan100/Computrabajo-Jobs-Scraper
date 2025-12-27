@@ -501,13 +501,14 @@ function parseJobDetail(html, baseUrl) {
     };
 }
 
-async function enrichJobWithDetail(job, httpClient, baseUrl) {
+async function enrichJobWithDetail(job, httpClient, baseUrl, getBrowserPage) {
     const detailUrl = normalizeUrl(job.url, baseUrl);
     if (!detailUrl) return job;
+    const cleanUrl = detailUrl.split('#')[0];
 
     try {
         const response = await httpClient.request({
-            url: detailUrl,
+            url: cleanUrl,
             headers: {
                 Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
@@ -517,10 +518,30 @@ async function enrichJobWithDetail(job, httpClient, baseUrl) {
 
         if (response.statusCode >= 400 || !response.body) return job;
 
-        const detail = parseJobDetail(response.body, baseUrl);
+        let detail = parseJobDetail(response.body, baseUrl);
+
+        // Browser fallback for missing description/company
+        if (getBrowserPage && (!detail.descriptionText || detail.descriptionText.length < 20)) {
+            try {
+                const page = await getBrowserPage();
+                if (page) {
+                    await page.goto(cleanUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
+                    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+                    const html = await page.content();
+                    const enriched = parseJobDetail(html, baseUrl);
+                    if (enriched.descriptionText && enriched.descriptionText.length > detail.descriptionText?.length) {
+                        detail = enriched;
+                    }
+                    await page.close().catch(() => {});
+                }
+            } catch (err) {
+                log.debug(`Browser detail fetch failed for ${cleanUrl}: ${err.message}`);
+            }
+        }
+
         return {
             ...job,
-            url: detailUrl,
+            url: cleanUrl,
             descriptionHtml: formatDescription(detail.descriptionHtml, detail.descriptionText || job.descriptionText),
             descriptionText: detail.descriptionText || job.descriptionText || stripHtml(detail.descriptionHtml),
             company: detail.company || job.company,
@@ -535,21 +556,46 @@ async function enrichJobWithDetail(job, httpClient, baseUrl) {
     }
 }
 
-async function enrichJobsWithDetails(jobs, httpClient, baseUrl, maxConcurrency = 8) {
+async function enrichJobsWithDetails(jobs, httpClient, baseUrl, maxConcurrency = 8, proxyConfiguration) {
     const enriched = [];
     let index = 0;
+    let browser = null;
+    let context = null;
+
+    const getBrowserPage = proxyConfiguration
+        ? async () => {
+              if (!browser) {
+                  const proxyUrl = await proxyConfiguration.newUrl();
+                  browser = await firefox.launch(
+                      await camoufoxLaunchOptions({
+                          headless: true,
+                          proxy: proxyUrl,
+                          geoip: true,
+                          os: 'windows',
+                          locale: 'es-ES',
+                      }),
+                  );
+                  context = await browser.newContext({
+                      locale: 'es-ES',
+                      userAgent: USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
+                  });
+              }
+              return await context.newPage();
+          }
+        : null;
 
     const worker = async () => {
         while (index < jobs.length) {
             const current = jobs[index];
             index += 1;
-            const result = await enrichJobWithDetail(current, httpClient, baseUrl);
+            const result = await enrichJobWithDetail(current, httpClient, baseUrl, getBrowserPage);
             enriched.push(result);
         }
     };
 
     const workers = Array.from({ length: Math.min(maxConcurrency, jobs.length) }, () => worker());
     await Promise.all(workers);
+    if (browser) await browser.close().catch(() => {});
 
     return enriched;
 }
@@ -876,7 +922,7 @@ try {
         let chunk = uniqueJobs.slice(i, i + chunkSize);
         if (includeFullDescription) {
             log.info(`Fetching detail pages for chunk ${i / chunkSize + 1} (${chunk.length} jobs)...`);
-            chunk = await enrichJobsWithDetails(chunk, httpClient, baseUrl, Math.min(10, chunk.length));
+            chunk = await enrichJobsWithDetails(chunk, httpClient, baseUrl, Math.min(10, chunk.length), proxyConfiguration);
         }
 
         const normalizedChunk = chunk.map(job => {
