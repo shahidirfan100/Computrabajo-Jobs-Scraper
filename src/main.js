@@ -382,7 +382,7 @@ function extractJobsViaJsonLD(html) {
  */
 function parseJobPosting(jobData) {
     const hiringOrg = jobData.hiringOrganization || {};
-    const jobLocation = jobData.jobLocation || {};
+    const jobLocation = Array.isArray(jobData.jobLocation) ? jobData.jobLocation[0] || {} : jobData.jobLocation || {};
     const address = jobLocation.address || {};
 
     let location = '';
@@ -401,12 +401,16 @@ function parseJobPosting(jobData) {
         if (jobData.baseSalary.currency) salary += ` ${jobData.baseSalary.currency}`;
     }
 
+    const jobTypeRaw = Array.isArray(jobData.employmentType)
+        ? jobData.employmentType.join(', ')
+        : jobData.employmentType;
+
     return {
         title: jobData.title || '',
         company: hiringOrg.name || '',
         location,
         salary,
-        jobType: jobData.employmentType || 'Not specified',
+        jobType: jobTypeRaw || 'Not specified',
         postedDate: jobData.datePosted || '',
         descriptionHtml: jobData.description || '',
         descriptionText: stripHtml(jobData.description || ''),
@@ -476,18 +480,37 @@ function parseJobDetail(html, baseUrl) {
 
     const company =
         fromJson.company ||
-        $('.fc_base.fs20, .fc_base.mt5.fs16, a[data-company], a[data-accion*="Company"]').first().text().trim();
+        $('.fc_base.fs20, .fc_base.mt5.fs16, a[data-company], a[data-accion*="Company"], [itemprop="hiringOrganization"]')
+            .first()
+            .text()
+            .trim();
 
     const location =
         fromJson.location ||
-        $('.fc_base.fs13, .fs13.fc_aux:not(.t_date), .tag_base, [data-qa="location"]').first().text().trim();
+        $('.fc_base.fs13, .fs13.fc_aux:not(.t_date), .tag_base, [data-qa="location"], [itemprop="addressLocality"]')
+            .first()
+            .text()
+            .trim();
 
     const postedDate =
         fromJson.postedDate ||
+        $('meta[itemprop="datePosted"]').attr('content') ||
+        $('time[datetime]').attr('datetime') ||
         $('.fs13.fc_aux.t_date, .t_date, time, [data-qa="postedDate"]').first().text().trim();
+
     const salary =
         fromJson.salary ||
-        $('.bCS.b-salary, .fs16.fc_base:not(.mt5), [data-qa="salary"], .tag_base.salary').first().text().trim();
+        $('.bCS.b-salary, .fs16.fc_base:not(.mt5), [data-qa="salary"], .tag_base.salary, [itemprop="baseSalary"]')
+            .first()
+            .text()
+            .trim();
+
+    const jobType =
+        fromJson.jobType ||
+        $('[data-qa="employmentType"], .tag_base:contains("Tiempo"), .tag_base:contains("Completo")')
+            .first()
+            .text()
+            .trim();
 
     return {
         descriptionHtml,
@@ -495,7 +518,7 @@ function parseJobDetail(html, baseUrl) {
         company: company || fromJson.company || '',
         location: location || fromJson.location || '',
         salary: salary || fromJson.salary || 'Not specified',
-        jobType: fromJson.jobType || 'Not specified',
+        jobType: jobType || 'Not specified',
         postedDate,
         url: normalizeUrl(fromJson.url || '', baseUrl),
     };
@@ -521,16 +544,23 @@ async function enrichJobWithDetail(job, httpClient, baseUrl, getBrowserPage) {
         let detail = parseJobDetail(response.body, baseUrl);
 
         // Browser fallback for missing description/company
-        if (getBrowserPage && (!detail.descriptionText || detail.descriptionText.length < 20)) {
+        if (getBrowserPage && (!detail.descriptionText || detail.descriptionText.length < 20 || detail.salary === 'Not specified')) {
             try {
                 const page = await getBrowserPage();
                 if (page) {
                     await page.goto(cleanUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
+                    await page.waitForSelector('div.description_offer, [itemprop="description"], .bVj, .box_detail', { timeout: 8000 }).catch(() => {});
                     await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
                     const html = await page.content();
                     const enriched = parseJobDetail(html, baseUrl);
                     if (enriched.descriptionText && enriched.descriptionText.length > detail.descriptionText?.length) {
                         detail = enriched;
+                    }
+                    if (detail.salary === 'Not specified' && enriched.salary && enriched.salary !== 'Not specified') {
+                        detail.salary = enriched.salary;
+                    }
+                    if (detail.postedDate === 'Not specified' && enriched.postedDate) {
+                        detail.postedDate = enriched.postedDate;
                     }
                     await page.close().catch(() => {});
                 }
@@ -578,6 +608,7 @@ async function enrichJobsWithDetails(jobs, httpClient, baseUrl, maxConcurrency =
                   context = await browser.newContext({
                       locale: 'es-ES',
                       userAgent: USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
+                      viewport: { width: 1280, height: 900 },
                   });
               }
               return await context.newPage();
