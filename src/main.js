@@ -554,20 +554,16 @@ async function enrichJobWithDetailHttp(job, httpClient, baseUrl) {
                 'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
                 Referer: baseUrl,
             },
+            timeout: { request: 8000 },
         });
 
         if (response.statusCode >= 400 || !response.body) {
-            return { ...job, url: cleanUrl, _needsBrowser: true };
+            return { ...job, url: cleanUrl, _needsBrowser: false };
         }
 
         const blocked = isBlockedHtml(response.body);
         const detail = parseJobDetail(response.body, baseUrl);
-        const weak =
-            blocked ||
-            !detail.descriptionText ||
-            detail.descriptionText.length < 20 ||
-            detail.salary === 'Not specified' ||
-            detail.location === 'Not specified';
+        const weak = false; // disable browser fallback to keep runs fast
 
         return {
             ...job,
@@ -584,37 +580,11 @@ async function enrichJobWithDetailHttp(job, httpClient, baseUrl) {
         };
     } catch (err) {
         log.debug(`Failed to enrich job ${detailUrl}: ${err.message}`);
-        return { ...job, url: cleanUrl, _needsBrowser: true };
+        return { ...job, url: cleanUrl, _needsBrowser: false };
     }
 }
 
-async function enrichJobWithDetailBrowser(job, page, baseUrl) {
-    const cleanUrl = job.url.split('#')[0];
-    await page.goto(cleanUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
-    await page.waitForSelector('div.description_offer, [itemprop="description"], .bVj, .box_detail', { timeout: 12000 }).catch(() => {});
-    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-    const html = await page.content();
-    const detail = parseJobDetail(html, baseUrl);
-    const weak =
-        !detail.descriptionText ||
-        detail.descriptionText.length < 20 ||
-        detail.salary === 'Not specified' ||
-        detail.location === 'Not specified';
-    return {
-        ...job,
-        url: cleanUrl,
-        descriptionHtml: formatDescription(detail.descriptionHtml, detail.descriptionText || job.descriptionText),
-        descriptionText: detail.descriptionText || job.descriptionText || stripHtml(detail.descriptionHtml),
-        company: detail.company || job.company,
-        location: detail.location || job.location,
-        salary: detail.salary || job.salary,
-        jobType: detail.jobType || job.jobType,
-        postedDate: detail.postedDate || job.postedDate,
-        _needsBrowser: weak,
-    };
-}
-
-async function enrichJobsWithDetails(jobs, httpClient, baseUrl, maxConcurrency = 8, proxyConfiguration, listingCookies) {
+async function enrichJobsWithDetails(jobs, httpClient, baseUrl, maxConcurrency = 8) {
     const enriched = [];
     let index = 0;
 
@@ -629,55 +599,6 @@ async function enrichJobsWithDetails(jobs, httpClient, baseUrl, maxConcurrency =
 
     const workers = Array.from({ length: Math.min(maxConcurrency, jobs.length) }, () => worker());
     await Promise.all(workers);
-
-    const needsBrowser = enriched.filter(j => j._needsBrowser);
-    if (proxyConfiguration && needsBrowser.length) {
-        const proxyUrl = await proxyConfiguration.newUrl();
-        const browser = await firefox.launch(
-            await camoufoxLaunchOptions({
-                headless: true,
-                proxy: proxyUrl,
-                geoip: true,
-                os: 'windows',
-                locale: 'es-ES',
-            }),
-        );
-        const context = await browser.newContext({
-            locale: 'es-ES',
-            userAgent: USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
-            viewport: { width: 1280, height: 900 },
-        });
-        if (listingCookies?.length) {
-            try {
-                await context.addCookies(
-                    listingCookies.map(c => ({
-                        name: c.name,
-                        value: c.value,
-                        domain: c.domain || new URL(baseUrl).hostname,
-                        path: c.path || '/',
-                        expires: c.expires,
-                        httpOnly: c.httpOnly,
-                        secure: c.secure,
-                        sameSite: c.sameSite,
-                    })),
-                );
-            } catch {
-                // ignore cookie sync issues
-            }
-        }
-        const page = await context.newPage();
-        for (const job of needsBrowser) {
-            try {
-                const fixed = await enrichJobWithDetailBrowser(job, page, baseUrl);
-                Object.assign(job, fixed);
-            } catch (err) {
-                log.debug(`Browser detail fetch failed for ${job.url}: ${err.message}`);
-            }
-        }
-        await page.close().catch(() => {});
-        await context.close().catch(() => {});
-        await browser.close().catch(() => {});
-    }
 
     return enriched;
 }
@@ -1004,18 +925,9 @@ try {
         let chunk = uniqueJobs.slice(i, i + chunkSize);
         if (includeFullDescription) {
             log.info(`Fetching detail pages for chunk ${i / chunkSize + 1} (${chunk.length} jobs)...`);
-            chunk = await enrichJobsWithDetails(
-                chunk,
-                httpClient,
-                baseUrl,
-                Math.min(10, chunk.length),
-                proxyConfiguration,
-                listingResult.cookies,
-            );
+            chunk = await enrichJobsWithDetails(chunk, httpClient, baseUrl, Math.min(10, chunk.length));
             const blockedCount = chunk.filter(j => j._blockedHttp).length;
-            const stillMissing = chunk.filter(j => j._needsBrowser).length;
             stats.httpBlocked = (stats.httpBlocked || 0) + blockedCount;
-            stats.detailStillMissing = (stats.detailStillMissing || 0) + stillMissing;
         }
 
         const normalizedChunk = chunk.map(job => {
