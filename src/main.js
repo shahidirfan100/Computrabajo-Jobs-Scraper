@@ -427,6 +427,19 @@ function stripHtml(html) {
     return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+function isBlockedHtml(html) {
+    if (!html) return false;
+    const text = html.toLowerCase();
+    return (
+        text.includes('captcha') ||
+        text.includes('access denied') ||
+        text.includes('blocked') ||
+        text.includes('robot') ||
+        text.includes('verifica') ||
+        text.includes('verificacion')
+    );
+}
+
 function findFirstJobPosting($) {
     let found = null;
 
@@ -542,14 +555,24 @@ async function enrichJobWithDetail(job, httpClient, baseUrl, getBrowserPage) {
         if (response.statusCode >= 400 || !response.body) return job;
 
         let detail = parseJobDetail(response.body, baseUrl);
+        const blocked = isBlockedHtml(response.body);
 
         // Browser fallback for missing description/company
-        if (getBrowserPage && (!detail.descriptionText || detail.descriptionText.length < 20 || detail.salary === 'Not specified')) {
+        if (
+            getBrowserPage &&
+            (blocked || !detail.descriptionText || detail.descriptionText.length < 20 || detail.salary === 'Not specified')
+        ) {
             try {
                 const page = await getBrowserPage();
                 if (page) {
                     await page.goto(cleanUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
-                    await page.waitForSelector('div.description_offer, [itemprop="description"], .bVj, .box_detail', { timeout: 8000 }).catch(() => {});
+                    await page.waitForSelector('div.description_offer, [itemprop="description"], .bVj, .box_detail', {
+                        timeout: 12000,
+                    }).catch(() => {});
+                    await page.waitForFunction(() => {
+                        const el = document.querySelector('div.description_offer, [itemprop="description"], .bVj, .box_detail');
+                        return el && el.textContent && el.textContent.trim().length > 20;
+                    }, { timeout: 12000 }).catch(() => {});
                     await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
                     const html = await page.content();
                     const enriched = parseJobDetail(html, baseUrl);
@@ -561,6 +584,9 @@ async function enrichJobWithDetail(job, httpClient, baseUrl, getBrowserPage) {
                     }
                     if (detail.postedDate === 'Not specified' && enriched.postedDate) {
                         detail.postedDate = enriched.postedDate;
+                    }
+                    if (detail.jobType === 'Not specified' && enriched.jobType) {
+                        detail.jobType = enriched.jobType;
                     }
                     await page.close().catch(() => {});
                 }
@@ -586,11 +612,12 @@ async function enrichJobWithDetail(job, httpClient, baseUrl, getBrowserPage) {
     }
 }
 
-async function enrichJobsWithDetails(jobs, httpClient, baseUrl, maxConcurrency = 8, proxyConfiguration) {
+async function enrichJobsWithDetails(jobs, httpClient, baseUrl, maxConcurrency = 8, proxyConfiguration, listingCookies) {
     const enriched = [];
     let index = 0;
     let browser = null;
     let context = null;
+    let cookiesApplied = false;
 
     const getBrowserPage = proxyConfiguration
         ? async () => {
@@ -610,6 +637,25 @@ async function enrichJobsWithDetails(jobs, httpClient, baseUrl, maxConcurrency =
                       userAgent: USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
                       viewport: { width: 1280, height: 900 },
                   });
+                  if (listingCookies?.length && !cookiesApplied) {
+                      try {
+                          await context.addCookies(
+                              listingCookies.map(c => ({
+                                  name: c.name,
+                                  value: c.value,
+                                  domain: c.domain || new URL(baseUrl).hostname,
+                                  path: c.path || '/',
+                                  expires: c.expires,
+                                  httpOnly: c.httpOnly,
+                                  secure: c.secure,
+                                  sameSite: c.sameSite,
+                              })),
+                          );
+                          cookiesApplied = true;
+                      } catch {
+                          // ignore cookie sync issues
+                      }
+                  }
               }
               return await context.newPage();
           }
@@ -953,12 +999,32 @@ try {
         let chunk = uniqueJobs.slice(i, i + chunkSize);
         if (includeFullDescription) {
             log.info(`Fetching detail pages for chunk ${i / chunkSize + 1} (${chunk.length} jobs)...`);
-            chunk = await enrichJobsWithDetails(chunk, httpClient, baseUrl, Math.min(10, chunk.length), proxyConfiguration);
+            chunk = await enrichJobsWithDetails(
+                chunk,
+                httpClient,
+                baseUrl,
+                Math.min(10, chunk.length),
+                proxyConfiguration,
+                listingResult.cookies,
+            );
         }
 
         const normalizedChunk = chunk.map(job => {
             const descriptionHtml = formatDescription(job.descriptionHtml, job.descriptionText);
             const descriptionText = job.descriptionText || stripHtml(descriptionHtml);
+            const missingFields = [];
+            if (!descriptionText || descriptionText === 'Not specified') missingFields.push('descriptionText');
+            if (!job.location || job.location === 'Not specified') missingFields.push('location');
+            if (!job.salary || job.salary === 'Not specified') missingFields.push('salary');
+            if (!job.jobType || job.jobType === 'Not specified') missingFields.push('jobType');
+            if (!job.postedDate) missingFields.push('postedDate');
+            if (missingFields.length) {
+                stats.missingDetails = (stats.missingDetails || 0) + 1;
+                stats.missingSamples = stats.missingSamples || [];
+                if (stats.missingSamples.length < 5) {
+                    stats.missingSamples.push({ url: job.url, missingFields });
+                }
+            }
             return {
                 title: job.title || 'Not specified',
                 company: job.company || 'Not specified',
